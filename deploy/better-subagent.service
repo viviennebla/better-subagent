@@ -1,0 +1,15 @@
+[Unit]
+Description=better-subagent Codex Session Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/better-subagent
+ExecStart=/usr/bin/python3 -m better_subagent --host 127.0.0.1 --port 8790
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

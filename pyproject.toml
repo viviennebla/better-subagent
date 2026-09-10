@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "better-subagent"
+version = "0.1.0"
+description = "A lightweight Codex Session Gateway"
+requires-python = ">=3.11"
+
+[project.scripts]
+better-subagent = "better_subagent.server:main"
+
+[tool.setuptools]
+packages = ["better_subagent"]
