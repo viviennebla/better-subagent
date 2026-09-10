@@ -1,6 +1,6 @@
 # better-subagent App Server 下一轮开发计划
 
-状态：**用户已批准，Phase 0 执行中**
+状态：**用户已批准；Phase 0 等待 remote-control 显式授权**
 
 日期：2026-09-10
 
