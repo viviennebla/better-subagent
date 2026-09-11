@@ -21,6 +21,8 @@ from .contracts import (
     run_status,
     session_summary,
     validate_interrupt_run,
+    validate_approval_decision,
+    validate_steer_run,
     validate_session_config,
     validate_start_run,
 )
@@ -36,7 +38,7 @@ class JsonGatewayStore:
         self._thread_lock = threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
-            self._write_unlocked({"schemaVersion": 1, "sessions": {}, "runs": []})
+            self._write_unlocked({"schemaVersion": 1, "sessions": {}, "runs": [], "pendingApprovals": {}})
 
     @contextmanager
     def locked(self) -> Iterator[dict[str, Any]]:
@@ -83,6 +85,70 @@ class GatewayService:
     def __init__(self, store: JsonGatewayStore, transport: GatewayTransport) -> None:
         self.store = store
         self.transport = transport
+        listener = getattr(transport, "add_notification_listener", None)
+        if listener is not None:
+            listener(self._on_transport_notification)
+        approval_handler = getattr(transport, "set_approval_handler", None)
+        if approval_handler is not None:
+            approval_handler(self._on_approval_request)
+
+    def _on_approval_request(self, request_id: str | int, params: dict[str, Any]) -> None:
+        with self.store.locked() as board:
+            params = dict(params)
+            method = params.pop("_requestMethod", None)
+            board.setdefault("pendingApprovals", {})[str(request_id)] = {"requestId": request_id, "method": method, "params": params, "createdAt": now_iso()}
+            thread_id = params.get("threadId")
+            for session in board["sessions"].values():
+                if session.get("threadId") == thread_id:
+                    session.update({"runtimeStatus": "waitingOnApproval", "updatedAt": now_iso()})
+            self.store.save(board)
+
+    def _on_transport_notification(self, message: dict[str, Any]) -> None:
+        """Project an unowned active turn as external; never interrupt it."""
+        method = message.get("method", "")
+        params = message.get("params") or {}
+        if method == "serverRequest/resolved":
+            request_id = str(params.get("requestId") or params.get("id") or "")
+            if request_id:
+                with self.store.locked() as board:
+                    board.setdefault("pendingApprovals", {}).pop(request_id, None)
+                    for session in board["sessions"].values():
+                        if session.get("runtimeStatus") == "waitingOnApproval" and session.get("threadId") == params.get("threadId"):
+                            session.update({"runtimeStatus": "active", "updatedAt": now_iso()})
+                    self.store.save(board)
+            return
+        if method not in {"turn/started", "thread/status/changed", "transport/status"}:
+            return
+        status = params.get("status") or params.get("threadStatus")
+        if isinstance(status, dict):
+            status = status.get("type")
+        if method == "transport/status":
+            if params.get("status") == "unknown":
+                with self.store.locked() as board:
+                    for session in board["sessions"].values():
+                        if session.get("controlMode", "managed") == "managed":
+                            session.update({"runtimeStatus": "unknown", "updatedAt": now_iso()})
+                    self.store.save(board)
+            return
+        active = method == "turn/started" or status in {"active", "inProgress", "running"}
+        if not active:
+            return
+        turn = params.get("turn") or {}
+        thread = params.get("threadId") or params.get("thread", {}).get("id")
+        if not thread:
+            return
+        with self.store.locked() as board:
+            for session in board["sessions"].values():
+                if session.get("threadId") == thread:
+                    managed = any(
+                        run.get("sessionId") == session.get("sessionId")
+                        and run.get("status") in {"starting", "active", "interrupting"}
+                        for run in board["runs"]
+                    )
+                    if managed:
+                        continue
+                    session.update({"controlMode": "external", "runtimeStatus": "active", "activeTurnId": params.get("turnId") or turn.get("id"), "updatedAt": now_iso()})
+            self.store.save(board)
 
     def list_sessions(self) -> dict[str, Any]:
         board = self.store.read()
@@ -127,6 +193,14 @@ class GatewayService:
                     details={"reason": session.get("unavailableReason", "")},
                     request_id=request["requestId"],
                 )
+            if session.get("controlMode", "managed") == "external":
+                raise GatewayError(
+                    "session_external",
+                    "目标 Session 当前由 CLI/GUI 控制",
+                    status=409,
+                    details={"controlMode": "external", "runtimeStatus": session.get("runtimeStatus", "unknown")},
+                    request_id=request["requestId"],
+                )
             occupying = next(
                 (
                     run
@@ -157,6 +231,8 @@ class GatewayService:
             self.store.save(board)
             gateway_run_id = run["gatewayRunId"]
             runtime = {key: session[key] for key in ("threadId", "cwd", "model", "effort", "approvalPolicy", "sandboxPolicy")}
+            runtime["requestedPolicy"] = session.get("requestedPolicy")
+            runtime["runtimeWorkspaceRoots"] = session.get("runtimeWorkspaceRoots", [session["cwd"]])
 
         def worker_result(status: str, error: str | None) -> None:
             if status == "unknown":
@@ -192,14 +268,76 @@ class GatewayService:
         with self.store.locked() as board:
             run = self._find_run(board, gateway_run_id)
             run.update({key: result[key] for key in ("transportTurnId", "processId", "logPath", "stderrLogPath") if key in result})
-            if run["status"] == "starting":
+            terminal = run["status"] in TERMINAL_RUN_STATUSES or run["status"] == "unknown"
+            if run["status"] == "starting" and not terminal:
                 run.update({"status": "active", "startedAt": now_iso(), "updatedAt": now_iso()})
+            session = board["sessions"].get(run["sessionId"])
+            if isinstance(session, dict) and run["status"] not in TERMINAL_RUN_STATUSES | {"unknown"}:
+                session.update({"runtimeStatus": "active", "activeTurnId": run.get("transportTurnId"), "updatedAt": now_iso()})
+                if result.get("effectivePolicy") is not None:
+                    session["effectivePolicy"] = result["effectivePolicy"]
+                    session["policyUpdatedAt"] = now_iso()
             self.store.save(board)
             return {"run": run_status(run), "idempotent": False}
 
     def get_run(self, gateway_run_id: str) -> dict[str, Any]:
         board = self.store.read()
         return {"run": run_status(self._find_run(board, gateway_run_id))}
+
+    def history(self, session_id: str) -> dict[str, Any]:
+        board = self.store.read()
+        session = board["sessions"].get(session_id)
+        if not isinstance(session, dict):
+            raise GatewayError("session_not_found", "目标 Session 不存在", status=404)
+        reader = getattr(self.transport, "read_thread", None)
+        if reader is None:
+            raise GatewayError("transport_unsupported", "当前 transport 不支持历史读取", status=501)
+        try:
+            return {"sessionId": session_id, "history": reader(session["threadId"], include_turns=True)}
+        except Exception as exc:
+            raise GatewayError("history_unavailable", "Session 历史读取失败", status=502, details={"reason": str(exc)[:1000]}) from exc
+
+    def steer_run(self, gateway_run_id: str, payload: Any) -> dict[str, Any]:
+        request = validate_steer_run(payload)
+        board = self.store.read()
+        run = self._find_run(board, gateway_run_id)
+        if run.get("status") != "active":
+            raise GatewayError("run_not_active", "只有 active Run 可以 steer", status=409)
+        steer = getattr(self.transport, "steer_turn", None)
+        if steer is None:
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 steer", status=501)
+        try:
+            session = board["sessions"].get(run["sessionId"], {})
+            result = steer({"threadId": session.get("threadId"), "expectedTurnId": run.get("transportTurnId"), "prompt": request["prompt"]})
+        except Exception as exc:
+            raise GatewayError("steer_failed", "Run steer 失败", status=502, details={"reason": str(exc)[:1000]}, request_id=request["requestId"]) from exc
+        return {"run": run_status(run), "result": result}
+
+    def approval_decision(self, request_id: str, payload: Any) -> dict[str, Any]:
+        request = validate_approval_decision(payload)
+        if request_id != request["requestId"]:
+            raise GatewayError("validation_error", "路径 requestId 与请求体不一致", status=422)
+        responder = getattr(self.transport, "respond_approval", None)
+        if responder is None:
+            raise GatewayError("transport_unsupported", "当前 transport 不支持审批", status=501)
+        try:
+            pending = self.store.read().get("pendingApprovals", {}).get(request_id)
+            if not isinstance(pending, dict):
+                raise GatewayError("approval_not_found", "审批请求不存在或已解决", status=409, request_id=request_id)
+            is_permissions = pending.get("method") == "item/permissions/requestApproval"
+            if is_permissions and request.get("decision") in {"accept", "acceptForSession"} and request.get("grantedPermissions") is None:
+                raise GatewayError("validation_error", "permissions 审批必须提供 grantedPermissions", status=422, request_id=request_id)
+            if not is_permissions and request.get("grantedPermissions") is not None:
+                raise GatewayError("validation_error", "grantedPermissions 只适用于 permissions 审批", status=422, request_id=request_id)
+            responder(request_id, request["decision"], permissions=request.get("grantedPermissions"), method=pending.get("method"), params=pending.get("params"))
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError("approval_failed", "审批响应失败", status=502, details={"reason": str(exc)[:1000]}, request_id=request_id) from exc
+        with self.store.locked() as board:
+            board.setdefault("pendingApprovals", {}).pop(request_id, None)
+            self.store.save(board)
+        return {"requestId": request_id, "decision": request["decision"]}
 
     def interrupt_run(self, gateway_run_id: str, payload: Any) -> dict[str, Any]:
         request = validate_interrupt_run(payload)
@@ -223,7 +361,8 @@ class GatewayService:
             if not run.get("transportTurnId") or not isinstance(run.get("processId"), int):
                 raise GatewayError("run_not_interruptible", "Run 缺少当前 Gateway 持有的 worker", status=409)
             run.update({"status": "interrupting", "interruptRequestId": request["requestId"], "updatedAt": now_iso()})
-            params = {"transportTurnId": run["transportTurnId"], "processId": run["processId"]}
+            session = board["sessions"].get(run["sessionId"], {})
+            params = {"transportTurnId": run["transportTurnId"], "processId": run["processId"], "threadId": session.get("threadId")}
             self.store.save(board)
         try:
             self.transport.interrupt_turn(params)
@@ -237,7 +376,10 @@ class GatewayService:
                 "interrupt_failed", "Codex Run 打断失败", status=502,
                 details={"reason": str(exc)[:1000]}, request_id=request["requestId"]
             ) from exc
-        return {"run": self._set_terminal(gateway_run_id, "interrupted", None), "idempotent": False}
+        current = self.get_run(gateway_run_id)["run"]
+        if current["status"] == "interrupting":
+            return {"run": current, "idempotent": False}
+        return {"run": current, "idempotent": False}
 
     def _set_unknown(self, gateway_run_id: str, error: str) -> dict[str, Any]:
         with self.store.locked() as board:
@@ -255,6 +397,9 @@ class GatewayService:
             if run.get("status") not in TERMINAL_RUN_STATUSES:
                 timestamp = now_iso()
                 run.update({"status": status, "updatedAt": timestamp, "terminalAt": timestamp, "error": error})
+                session = board["sessions"].get(run["sessionId"])
+                if isinstance(session, dict) and session.get("activeTurnId") == run.get("transportTurnId"):
+                    session.update({"runtimeStatus": "idle", "activeTurnId": None, "updatedAt": timestamp})
                 self.store.save(board)
             return run_status(run)
 

@@ -6,7 +6,7 @@
 
 better-subagent 是 Codex Session Gateway。它独占 Session runtime 配置、Session 单活、Gateway Run、SDK worker 与 interrupt；Board 只传 `sessionId`、完整 Prompt 和稳定 `requestId`。Browser 与 Agent 不直接访问 Gateway。
 
-本轮继续使用 `@openai/codex-sdk` 0.153.4 与 `scripts/codex-sdk-worker.mjs`，使用原子 JSON 文件，不包含登录/RBAC、SQLite、App Server、运行时审批转发、HA 或跨进程恢复。
+当前默认使用长期 App Server transport；`sdk-worker` 通过配置保留为回退。使用原子 JSON 文件，不包含登录/RBAC、SQLite、HA 或跨进程恢复。
 
 ## SessionSummary
 
@@ -104,8 +104,11 @@ POST /v1/runs/{gatewayRunId}/interrupt
 
 `PUT /v1/sessions/{sessionId}` 是 Board/迁移工具使用的内部入口，提交完整的 `sessionId/owner/role/threadId/cwd/model/effort/approvalPolicy/sandboxPolicy/enabled/unavailableReason`。存在占用 Run 时返回 `409 session_busy`。
 
+Runtime 接口还包括 `GET /v1/sessions/{sessionId}/history`、`POST /v1/runs/{gatewayRunId}/steer` 和 `POST /v1/approvals/{requestId}/decision`。Session summary 会投影 `controlMode`、`runtimeStatus`、`activeTurnId` 及 requested/effective policy；`external` 由 App Server 运行事件触发，Gateway 不会后台抢回控制。
+
 ## 已知延后
 
 - Gateway 重启后的 worker attach/reconcile；当前 `unknown` 需要人工处理。
+- 自动 reconnect/re-hydration、分页 history、permission profile discovery、`configRequirements/read` 与完整 settings effective projection 延后到 C1/C2 校准。
 - SDK 原生审批转发和 App Server transport。后续迁移采用“开发效率优先、宽基础权限 + 可控提权”的[App Server 权限调查与建议](./APP-SERVER-PERMISSIONS-INVESTIGATION.md)，不把 coder 默认限制为 read-only 或逐命令人工审批。
 - 登录、不可伪造身份、细粒度 RBAC、日志治理、SQLite、HA 和部署。

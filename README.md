@@ -2,16 +2,19 @@
 
 `better-subagent` 是面向 Codex Session 的轻量 Gateway。它把 Session 注册、单活 Run、启动、状态查询和打断从 Web Ledger 中抽离出来，让 Board 只处理 Task、人工调度和业务状态。
 
-当前 `0.1` 基线仍通过 `@openai/codex-sdk` worker 恢复既有 thread。下一轮将迁移到长期运行的 Codex App Server，并加入人工查看、审批、steer 和 CLI/GUI 控制权移交。待评审方案见 [`docs/APP-SERVER-NEXT-ROUND-PLAN.md`](docs/APP-SERVER-NEXT-ROUND-PLAN.md)。
+当前实现已完成 App Server transport/runtime 的静态 review，默认连接 GUI-managed Codex App Server；仍需 C1 runtime calibration。SDK worker 保留为配置级回退。方案与校准边界见 [`docs/APP-SERVER-NEXT-ROUND-PLAN.md`](docs/APP-SERVER-NEXT-ROUND-PLAN.md)。
 
 ## 当前接口
 
 - `GET /health`
 - `GET /v1/sessions`
 - `PUT /v1/sessions/{sessionId}`
+- `GET /v1/sessions/{sessionId}/history`
 - `POST /v1/runs`
 - `GET /v1/runs/{gatewayRunId}`
+- `POST /v1/runs/{gatewayRunId}/steer`
 - `POST /v1/runs/{gatewayRunId}/interrupt`
+- `POST /v1/approvals/{requestId}/decision`
 
 完整合同见 [`docs/BETTER-SUBAGENT-CONTRACT.md`](docs/BETTER-SUBAGENT-CONTRACT.md)。
 
@@ -19,7 +22,7 @@
 
 ```bash
 npm ci
-python3 -m better_subagent --host 127.0.0.1 --port 8790
+python3 -m better_subagent --host 127.0.0.1 --port 1999
 ```
 
 默认运行数据写入 `data/better-subagent.json`，运行日志和数据不进入 Git。

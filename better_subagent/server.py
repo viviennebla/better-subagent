@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlparse
 
 from .contracts import GatewayError
 from .gateway import GatewayService, JsonGatewayStore
-from .transport import CodexSdkWorkerTransport
+from .transport import AppServerTransport, CodexSdkWorkerTransport
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -36,6 +36,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             run_id = unquote(path[len(prefix):])
             self._handle(lambda _payload: self.gateway.get_run(run_id), HTTPStatus.OK, body=False)
             return
+        session_prefix = "/v1/sessions/"
+        if path.startswith(session_prefix) and path.endswith("/history"):
+            session_id = unquote(path[len(session_prefix):-len("/history")].rstrip("/"))
+            self._handle(lambda _payload: self.gateway.history(session_id), HTTPStatus.OK, body=False)
+            return
         self._json(HTTPStatus.NOT_FOUND, GatewayError("not_found", "接口不存在", status=404).to_dict())
 
     def do_PUT(self) -> None:
@@ -57,6 +62,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path.startswith(prefix) and path.endswith(suffix):
             run_id = unquote(path[len(prefix):-len(suffix)].rstrip("/"))
             self._handle(lambda payload: self.gateway.interrupt_run(run_id, payload), HTTPStatus.OK)
+            return
+        steer_suffix = "/steer"
+        if path.startswith(prefix) and path.endswith(steer_suffix):
+            run_id = unquote(path[len(prefix):-len(steer_suffix)].rstrip("/"))
+            self._handle(lambda payload: self.gateway.steer_run(run_id, payload), HTTPStatus.OK)
+            return
+        approval_prefix = "/v1/approvals/"
+        approval_suffix = "/decision"
+        if path.startswith(approval_prefix) and path.endswith(approval_suffix):
+            request_id = unquote(path[len(approval_prefix):-len(approval_suffix)].rstrip("/"))
+            self._handle(lambda payload: self.gateway.approval_decision(request_id, payload), HTTPStatus.OK)
             return
         self._json(HTTPStatus.NOT_FOUND, GatewayError("not_found", "接口不存在", status=404).to_dict())
 
@@ -105,11 +121,18 @@ def main() -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8790)
+    parser.add_argument("--port", type=int, default=1999)
     parser.add_argument("--data", type=Path, default=root / "data" / "better-subagent.json")
+    parser.add_argument("--transport", choices=("sdk-worker", "app-server"), default="app-server")
+    parser.add_argument("--app-server-socket", type=Path, default=Path.home() / ".codex/app-server-control/app-server-control.sock")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    gateway = GatewayService(JsonGatewayStore(args.data), CodexSdkWorkerTransport())
+    transport = (
+        AppServerTransport(args.app_server_socket)
+        if args.transport == "app-server"
+        else CodexSdkWorkerTransport()
+    )
+    gateway = GatewayService(JsonGatewayStore(args.data), transport)
     server = GatewayHttpServer((args.host, args.port), gateway)
     logging.info("better-subagent listening on http://%s:%s", args.host, args.port)
     try:

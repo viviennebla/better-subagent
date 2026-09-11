@@ -1,6 +1,6 @@
 # better-subagent App Server 下一轮开发计划
 
-状态：**用户已批准；C0 有条件通过，Phase 1 执行中**
+状态：**用户已批准；C0 有条件通过，Phase 1 静态 review 已通过，待 C1 runtime calibration**
 
 日期：2026-09-10
 
@@ -209,6 +209,8 @@ Board 提供“移交到 CLI/GUI”：
 - 接入审批请求与 `serverRequest/resolved`；
 - 加入 `managed/external` 判断和外部 active turn 自动让出；
 - 保留 `sdk-worker` feature flag 作为一轮回退，不新增长期双实现维护承诺。
+
+Phase 1 静态 review 已覆盖协议 payload、terminal/approval 生命周期、external/unknown 投影与 SDK 回退。以下项目明确延期到后续校准/阶段，不作为本轮已完成能力宣称：自动 reconnect 后恢复并自动调度、分页 history、permission profile discovery、`configRequirements/read` 和完整 `thread/settings/update` effective projection。
 
 **Calibrate Gate C1：** 不接 Board，直接演示同一真实 Session 的 history、start、steer、interrupt、approval 和外部接入识别。
 

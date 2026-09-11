@@ -57,6 +57,14 @@ class BlockingInterruptTransport(FakeTransport):
         return {"status": "terminated"}
 
 
+class ImmediateTerminalTransport(FakeTransport):
+    def start_turn(self, params, on_terminal):
+        turn_id = "fast-1"
+        self.callbacks[turn_id] = on_terminal
+        on_terminal("completed", None)
+        return {"transportTurnId": turn_id, "processId": 1}
+
+
 def session_config() -> dict:
     return {
         "sessionId": SESSION_ID,
@@ -99,6 +107,23 @@ class GatewayServiceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(GatewayError, "不同的 StartRun"):
             self.gateway.start_run({**payload, "prompt": "被替换的报告"})
+
+    def test_fast_terminal_does_not_reactivate_session(self) -> None:
+        transport = ImmediateTerminalTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        result = gateway.start_run({"requestId": "fast", "sessionId": SESSION_ID, "prompt": "快速完成"})
+        self.assertEqual(result["run"]["status"], "completed")
+        self.assertEqual(gateway.list_sessions()["sessions"][0]["status"], "idle")
+
+    def test_resolved_only_updates_matching_waiting_session(self) -> None:
+        second = "00000000-0000-0000-0000-000000000002"
+        self.gateway.put_session(second, {**session_config(), "sessionId": second, "threadId": "thread-2"})
+        self.gateway._on_approval_request("a", {"threadId": "thread-coder-1", "_requestMethod": "item/commandExecution/requestApproval"})
+        self.gateway._on_approval_request("b", {"threadId": "thread-2", "_requestMethod": "item/commandExecution/requestApproval"})
+        self.gateway._on_transport_notification({"method": "serverRequest/resolved", "params": {"requestId": "a", "threadId": "thread-coder-1"}})
+        board = self.gateway.store.read()
+        self.assertEqual(board["sessions"][SESSION_ID]["runtimeStatus"], "active")
+        self.assertEqual(board["sessions"][second]["runtimeStatus"], "waitingOnApproval")
 
     def test_single_active_run_and_terminal_callback_release_session(self) -> None:
         first = self.gateway.start_run({"requestId": "action-1", "sessionId": SESSION_ID, "prompt": "报告一"})
