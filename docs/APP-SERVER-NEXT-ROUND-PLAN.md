@@ -37,7 +37,7 @@
 默认开发策略为：
 
 ```text
-permission profile: vimo-development
+permission profile: :workspace
 approval policy: on-request
 approvals reviewer: auto_review
 workspace: 绑定仓库与 worktree 可写
@@ -45,7 +45,7 @@ network: 开发网络可用
 session approval: 允许 acceptForSession
 ```
 
-`vimo-development` 应覆盖编辑代码、运行测试/构建、安装依赖、访问开发与测试服务、写临时目录以及本地 Git add/commit。用户可以为可信本机会话显式选择 full access。
+默认 `development` preset 映射到本机已校准的 `:workspace` profile；用户可以显式选择宿主允许的其他 profile（包括 full access）。未知或宿主不允许的 profile 必须 fail closed。profile discovery 与 config requirements 校验延期到后续 C1/C2。
 
 本轮不做以下收紧：
 
@@ -64,7 +64,7 @@ Gateway 对外使用统一的 `operationPolicy`，吸收 App Server 在不同 RP
 ```json
 {
   "preset": "development",
-  "permissionProfileId": "vimo-development",
+  "permissionProfileId": ":workspace",
   "approvalPolicy": "on-request",
   "approvalsReviewer": "auto_review",
   "allowSessionApproval": true,
@@ -193,7 +193,7 @@ Board 提供“移交到 CLI/GUI”：
 3. 外部 client 启动 turn 后另一个 client 收到的状态事件；
 4. 未决审批请求能否由后接入 client 响应；
 5. daemon 或 Gateway 重启后 thread、turn 和 pending request 的恢复表现；
-6. `vimo-development` profile 与 `acceptForSession` 的真实生效行为。
+6. `:workspace` profile 与 `acceptForSession` 的真实生效行为。
 
 **Calibrate Gate C0：已通过。** 用户批准首版采用“打断后移交”；等待审批时不承诺跨 client 无缝接管。GUI 管理的 App Server 直接使用 Unix WebSocket，不要求切换为 daemon-managed 拓扑。
 
@@ -278,7 +278,7 @@ Phase 1 静态 review 已覆盖协议 payload、terminal/approval 生命周期�
 
 ## 9. Review 时需要确认的两项
 
-1. 默认采用 `vimo-development + on-request + auto_review + acceptForSession`；
+1. 默认采用 `:workspace + on-request + auto_review + acceptForSession`；
 2. 若 C0 不能证明未决审批可跨 client 接管，首版采用“打断当前 turn 后移交”。
 
 除这两项外，其余阶段可按上述模块边界直接拆任务执行。

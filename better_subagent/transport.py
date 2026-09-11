@@ -56,7 +56,6 @@ class AppServerTransport:
         self._notifications: list[NotificationCallback] = []
         self._approval: ApprovalCallback | None = None
         self._pending_approvals: dict[str, str] = {}
-        self._prepared_threads: set[str] = set()
         self._orphan_terminals: dict[tuple[int, str, str], tuple[str, str | None]] = {}
         self._frame_buffer = bytearray()
         self._message_buffer = bytearray()
@@ -101,7 +100,6 @@ class AppServerTransport:
             sock.settimeout(None)
             self._socket = sock
             self._generation += 1
-            self._prepared_threads.clear()
             self._frame_buffer.clear()
             self._message_buffer.clear()
             self._connected.set()
@@ -175,7 +173,7 @@ class AppServerTransport:
         request.pop("gatewayRunId", None)
         policy = request.pop("requestedPolicy", None)
         if policy and isinstance(policy, dict):
-            request["permissions"] = policy.get("permissionProfileId", "vimo-development")
+            request["permissions"] = policy.get("permissionProfileId", ":workspace")
             request["approvalPolicy"] = policy.get("approvalPolicy", request.get("approvalPolicy", "on-request"))
             request["approvalsReviewer"] = policy.get("approvalsReviewer", "auto_review")
             request["runtimeWorkspaceRoots"] = policy.get("runtimeWorkspaceRoots", request.get("runtimeWorkspaceRoots", []))
@@ -183,26 +181,50 @@ class AppServerTransport:
         request["input"] = [{"type": "text", "text": prompt}]
         thread_id = str(request.get("threadId", ""))
         effective_policy = None
-        if thread_id and thread_id not in self._prepared_threads:
+        if thread_id:
             resume = dict(request)
             resume.pop("input", None)
             resume.pop("model", None)
             resume.pop("effort", None)
             resume.pop("sandboxPolicy", None)
-            resume_result = self.resume_thread(resume)
-            effective_policy = resume_result.get("activePermissionProfile")
-            thread = resume_result.get("thread") or {}
-            resume_status = thread.get("status") or resume_result.get("status") or {}
-            status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
-            if status_type != "idle":
-                raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
-            read_result = self.read_thread(thread_id, include_turns=False)
+            try:
+                read_result = self.read_thread(thread_id, include_turns=False)
+                need_resume = False
+            except TransportRejected as exc:
+                message = str(exc).lower()
+                missing = message.startswith(("no rollout found for thread id", "thread not loaded", "thread notloaded"))
+                if not missing:
+                    raise
+                need_resume = True
+                read_result = None
+            if need_resume:
+                resume_result = self.resume_thread(resume)
+                effective_policy = resume_result.get("activePermissionProfile")
+                thread = resume_result.get("thread") or {}
+                resume_status = thread.get("status") or resume_result.get("status") or {}
+                status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
+                if status_type != "idle":
+                    raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
+                read_result = self.read_thread(thread_id, include_turns=False)
             read_thread = read_result.get("thread") or read_result
             read_status = read_thread.get("status") or {}
             read_type = read_status.get("type") if isinstance(read_status, dict) else read_status
+            if read_type == "notLoaded" and not need_resume:
+                resume_result = self.resume_thread(resume)
+                effective_policy = resume_result.get("activePermissionProfile")
+                thread = resume_result.get("thread") or {}
+                resume_status = thread.get("status") or resume_result.get("status") or {}
+                status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
+                if status_type != "idle":
+                    raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
+                read_result = self.read_thread(thread_id, include_turns=False)
+                read_thread = read_result.get("thread") or read_result
+                read_status = read_thread.get("status") or {}
+                read_type = read_status.get("type") if isinstance(read_status, dict) else read_status
             if read_type != "idle":
                 raise TransportRejected(f"Session read 状态不可启动 turn: {read_type or 'unknown'}")
-            self._prepared_threads.add(thread_id)
+            if effective_policy is None:
+                effective_policy = read_result.get("activePermissionProfile")
         # App Server uses permissions for named profiles; sandboxPolicy is a
         # legacy Gateway field and must never be sent alongside permissions.
         sandbox = request.pop("sandboxPolicy", None)

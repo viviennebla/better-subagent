@@ -18,7 +18,7 @@ App Server 不认识 VIMO 的 Task、owner、role 或 CAS，也不负责判断�
 
 建议将权限策略定义为“宽基础权限 + 可控提权”，而不是“极窄基础权限 + 高频人工批准”：
 
-- 日常 coder 使用服务端定义的 `vimo-development` profile；
+- 日常 coder 使用本机已校准的 `:workspace` profile；未知 profile fail closed，profile discovery 延期；
 - 工作区、绑定 worktree、构建缓存和临时目录可写；本地 Git commit 所需的 `.git` 写入不能被长期卡住；
 - 开发所需网络默认可用，包括依赖、Git、测试 API 和文档查询；
 - `approvalPolicy=on-request`，允许 Agent 为边界外动作说明原因并申请权限；
@@ -49,7 +49,7 @@ approvalsReviewer=user | auto_review
 - `:workspace`：工作区可写、网络受限；可作为保守回退，但仍不足以覆盖需要联网和本地 commit 的完整开发流程。
 - `:danger-full-access`：不应用 App Server 外层沙箱；只作为用户显式选择的可信本机模式。
 
-自定义 `vimo-development` 应由 App Server 宿主配置预先定义，Gateway 只传 profile ID，不接受调用方提交任意 profile JSON。首版语义应至少包含：
+Gateway 默认传 `:workspace`，并只传宿主已允许的 profile ID，不接受调用方提交任意 profile JSON。首版语义应至少包含：
 
 - 对 canonical `runtimeWorkspaceRoots` 写入；
 - 对绑定仓库 Git metadata 的本地提交能力；
@@ -89,7 +89,7 @@ Board 只传 `sessionId`、Prompt 和稳定 request ID。Gateway 根据自己的
 
 ```json
 {
-  "permissionProfileId": "vimo-development",
+  "permissionProfileId": ":workspace",
   "approvalPolicy": "on-request",
   "approvalsReviewer": "auto_review",
   "runtimeWorkspaceRoots": [
@@ -130,7 +130,7 @@ Board 只传 `sessionId`、Prompt 和稳定 request ID。Gateway 根据自己的
 - `process/spawn` 明确在宿主机无 Codex sandbox 启动进程；
 - `command/exec` 虽可指定沙箱，但属于独立的任意命令执行入口，不依赖受控 Turn。
 
-这些接口可以保留给可信本机客户端或 Gateway 内部运维，但不能进入 Browser action、自由文本或通用 RPC proxy。限制它们不会妨碍 Agent 在正常 Turn 内使用 Shell、补丁、测试和 Git；正常 Agent 工具仍由 `vimo-development` profile 承载。
+这些接口可以保留给可信本机客户端或 Gateway 内部运维，但不能进入 Browser action、自由文本或通用 RPC proxy。限制它们不会妨碍 Agent 在正常 Turn 内使用 Shell、补丁、测试和 Git；正常 Agent 工具由宿主允许的 `:workspace` profile 承载。
 
 ### 6.2 任意配置覆盖
 
@@ -160,7 +160,7 @@ Gateway 优先连接 Unix socket。若未来改用 WebSocket：
 
 ## 9. 当前建议
 
-1. App Server 迁移第一阶段采用 `vimo-development + on-request + auto_review`。
+1. App Server 迁移第一阶段采用 `:workspace + on-request + auto_review`。
 2. 保留 `:workspace` 作为故障回退，保留用户显式 full-access 入口，不把 full access 做成自动路由目标。
 3. 支持当前 Session 范围的重复授权，避免逐命令审批。
 4. Gateway 只做权限来源、Session 所有权、单写者和宿主机逃逸 RPC 的硬控制；不要为每种开发命令建立细粒度白名单。
@@ -177,6 +177,6 @@ Gateway 优先连接 Unix socket。若未来改用 WebSocket：
 
 ## 11. 未决项
 
-- `vimo-development` 的准确 filesystem/network TOML 需跟随 Gateway App Server 版本完成一次真实 schema 校准；0.154.0 的 named profile 仍是实验能力，不在本报告中冻结具体 TOML 语法。
+- profile discovery、`configRequirements/read` 与准确 filesystem/network 能力仍需后续真实 schema 校准；未知 profile 不自动回退。
 - GUI Remote 与 Gateway 是否共用同一个 App Server writer，需要以最终部署拓扑确认；权限 profile 本身不能解决双 writer。
 - 自动审批拒绝后是否回退人工审批，应在审批 UI 合同中单独确定，不应通过默认 full access 绕过。

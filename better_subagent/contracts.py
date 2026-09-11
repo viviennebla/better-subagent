@@ -173,7 +173,7 @@ def validate_session_config(session_id: str, value: Any) -> dict[str, Any]:
         "runtimeWorkspaceRoots": roots,
         "requestedPolicy": {
             "preset": preset,
-            "permissionProfileId": operation_policy.get("permissionProfileId", "vimo-development" if preset == "development" else preset),
+            "permissionProfileId": operation_policy.get("permissionProfileId", ":workspace" if preset == "development" else preset),
             "approvalPolicy": operation_policy.get("approvalPolicy", approval),
             "approvalsReviewer": operation_policy.get("approvalsReviewer", "auto_review"),
             "allowSessionApproval": bool(operation_policy.get("allowSessionApproval", True)),
