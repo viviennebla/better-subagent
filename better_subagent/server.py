@@ -31,12 +31,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/v1/sessions":
             self._handle(lambda _payload: self.gateway.list_sessions(), HTTPStatus.OK, body=False)
             return
+        session_prefix = "/v1/sessions/"
+        if path.startswith(session_prefix) and len(path) > len(session_prefix) and "/" not in path[len(session_prefix):]:
+            session_id = unquote(path[len(session_prefix):])
+            self._handle(lambda _payload: self.gateway.get_session(session_id), HTTPStatus.OK, body=False)
+            return
         prefix = "/v1/runs/"
         if path.startswith(prefix) and len(path) > len(prefix) and "/" not in path[len(prefix):]:
             run_id = unquote(path[len(prefix):])
             self._handle(lambda _payload: self.gateway.get_run(run_id), HTTPStatus.OK, body=False)
             return
-        session_prefix = "/v1/sessions/"
         if path.startswith(session_prefix) and path.endswith("/history"):
             session_id = unquote(path[len(session_prefix):-len("/history")].rstrip("/"))
             self._handle(lambda _payload: self.gateway.history(session_id), HTTPStatus.OK, body=False)
@@ -57,6 +61,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/v1/runs":
             self._handle(lambda payload: self.gateway.start_run(payload), HTTPStatus.CREATED)
             return
+        session_prefix = "/v1/sessions/"
+        for suffix, action in (("/handoff", self.gateway.handoff), ("/reclaim", self.gateway.reclaim)):
+            if path.startswith(session_prefix) and path.endswith(suffix):
+                session_id = unquote(path[len(session_prefix):-len(suffix)].rstrip("/"))
+                self._handle(lambda payload, action=action, session_id=session_id: action(session_id, payload), HTTPStatus.OK)
+                return
         prefix = "/v1/runs/"
         suffix = "/interrupt"
         if path.startswith(prefix) and path.endswith(suffix):

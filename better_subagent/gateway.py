@@ -25,6 +25,7 @@ from .contracts import (
     validate_steer_run,
     validate_session_config,
     validate_start_run,
+    validate_session_control,
 )
 from .transport import GatewayTransport, TransportOutcomeUnknown, TransportRejected
 
@@ -168,9 +169,119 @@ class GatewayService:
 
     def list_sessions(self) -> dict[str, Any]:
         board = self.store.read()
-        summaries = [session_summary(session, board["runs"]) for session in board["sessions"].values()]
+        summaries = [session_summary(session, board["runs"], pending_approval_count=len(self._pending_for_session(board, session))) for session in board["sessions"].values()]
         summaries.sort(key=lambda item: (item["role"], item["owner"], item["sessionId"]))
         return {"sessions": summaries}
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        board = self.store.read()
+        session = board["sessions"].get(session_id)
+        if not isinstance(session, dict):
+            raise GatewayError("session_not_found", "目标 Session 不存在", status=404)
+        pending = self._pending_for_session(board, session)
+        return {
+            "session": session_summary(session, board["runs"], pending_approval_count=len(pending)),
+            "pendingApprovals": pending,
+        }
+
+    @staticmethod
+    def _pending_for_session(board: dict[str, Any], session: dict[str, Any]) -> list[dict[str, Any]]:
+        result = []
+        for pending in board.get("pendingApprovals", {}).values():
+            if not isinstance(pending, dict) or pending.get("params", {}).get("threadId") != session.get("threadId"):
+                continue
+            params = pending.get("params", {})
+            method = pending.get("method")
+            available = params.get("availableDecisions") if isinstance(params, dict) else None
+            if method == "item/permissions/requestApproval":
+                exposed = [item for item in (available or []) if item in {"accept", "decline", "cancel", "acceptForSession"}] if isinstance(available, list) else []
+            elif method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+                supported = {"accept", "decline", "cancel", "acceptForSession"}
+                exposed = [item for item in (available or []) if item in supported] if isinstance(available, list) else []
+            else:
+                exposed = []
+            result.append({"requestId": pending.get("requestId"), "method": method, "sessionId": session.get("sessionId"), "turnId": params.get("turnId"), "availableDecisions": exposed, "status": pending.get("status", "pending")})
+        return result
+
+    def handoff(self, session_id: str, payload: Any) -> dict[str, Any]:
+        request = validate_session_control(payload)
+        with self.store.locked() as board:
+            session = board["sessions"].get(session_id)
+            if not isinstance(session, dict):
+                raise GatewayError("session_not_found", "目标 Session 不存在", status=404, request_id=request["requestId"])
+            if session.get("lastHandoffRequestId") == request["requestId"]:
+                return self._handoff_response(board, session_id, request["requestId"], idempotent=True, result=session.get("lastHandoffResult"))
+            if session.get("handoffRequestId") == request["requestId"] and session.get("handoffStatus") in {"pending", "completed", "failed", "unknown"}:
+                return self._handoff_response(board, session_id, request["requestId"], idempotent=True)
+            if session.get("handoffStatus") in {"pending", "unknown"}:
+                raise GatewayError("handoff_in_progress", "Session 正在处理另一个 handoff", status=409, request_id=request["requestId"])
+            if session.get("controlMode", "managed") == "external":
+                raise GatewayError("session_external", "Session 已由外部控制", status=409, request_id=request["requestId"])
+            active = session.get("runtimeStatus") in {"active", "waitingOnApproval"} and session.get("activeTurnId")
+            if not active:
+                if session.get("runtimeStatus") != "idle":
+                    raise GatewayError("session_not_idle", "只有 idle Session 可以交接", status=409, request_id=request["requestId"])
+                result = {"status": "completed", "requestId": request["requestId"]}
+                session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "handoffRequestId": request["requestId"], "handoffResult": result, "lastHandoffRequestId": request["requestId"], "lastHandoffResult": result, "updatedAt": now_iso()})
+                self.store.save(board)
+                return {"session": session_summary(session, board["runs"]), "handoff": {"status": "completed", "requestId": request["requestId"]}}
+            run = next((item for item in board["runs"] if item.get("sessionId") == session_id and item.get("status") in OCCUPYING_RUN_STATUSES), None)
+            if not isinstance(run, dict) or not run.get("transportTurnId") or not isinstance(run.get("processId"), int):
+                raise GatewayError("session_not_interruptible", "Session 缺少可交接的 active Run", status=409, request_id=request["requestId"])
+            run.update({"handoffRequestId": request["requestId"], "status": "interrupting", "updatedAt": now_iso()})
+            session.update({"requestedControlMode": "external", "handoffStatus": "pending", "handoffRequestId": request["requestId"], "updatedAt": now_iso()})
+            params = {"transportTurnId": run["transportTurnId"], "processId": run["processId"], "threadId": session.get("threadId")}
+            gateway_run_id = run["gatewayRunId"]
+            self.store.save(board)
+        try:
+            self.transport.interrupt_turn(params)
+        except TransportOutcomeUnknown as exc:
+            with self.store.locked() as board:
+                run = self._find_run(board, gateway_run_id)
+                session = board["sessions"].get(session_id)
+                if run.get("status") not in TERMINAL_RUN_STATUSES:
+                    run.update({"status": "unknown", "updatedAt": now_iso(), "error": str(exc)[:1000]})
+                if isinstance(session, dict):
+                    if run.get("status") not in TERMINAL_RUN_STATUSES:
+                        session.update({"runtimeStatus": "unknown", "handoffStatus": "unknown", "updatedAt": now_iso()})
+                self.store.save(board)
+                if run.get("status") in TERMINAL_RUN_STATUSES:
+                    return self._handoff_response(board, session_id, request["requestId"])
+            raise GatewayError("handoff_unknown", "Session 交接结果未知，已停止重试", status=502, details={"reason": str(exc)[:1000]}, request_id=request["requestId"]) from exc
+        except Exception as exc:
+            with self.store.locked() as board:
+                run = self._find_run(board, gateway_run_id)
+                if run.get("status") in TERMINAL_RUN_STATUSES:
+                    return self._handoff_response(board, session_id, request["requestId"])
+                if run.get("status") == "interrupting":
+                    run.update({"status": "active", "updatedAt": now_iso()})
+                session = board["sessions"].get(session_id)
+                if isinstance(session, dict):
+                    result = {"status": "failed", "requestId": request["requestId"]}
+                    session.update({"controlMode": "managed", "requestedControlMode": "managed", "handoffStatus": "failed", "handoffRequestId": request["requestId"], "handoffResult": result, "lastHandoffRequestId": request["requestId"], "lastHandoffResult": result, "updatedAt": now_iso()})
+                self.store.save(board)
+            raise GatewayError("handoff_failed", "Session 交接打断失败", status=502, details={"reason": str(exc)[:1000]}, request_id=request["requestId"]) from exc
+        detail = self.get_session(session_id)
+        return detail | {"handoff": {"status": detail["session"].get("handoffStatus", "pending"), "requestId": request["requestId"]}}
+
+    def reclaim(self, session_id: str, payload: Any) -> dict[str, Any]:
+        request = validate_session_control(payload)
+        with self.store.locked() as board:
+            session = board["sessions"].get(session_id)
+            if not isinstance(session, dict):
+                raise GatewayError("session_not_found", "目标 Session 不存在", status=404, request_id=request["requestId"])
+            if session.get("lastReclaimRequestId") == request["requestId"]:
+                result = dict(session.get("lastReclaimResult") or {"status": "completed", "requestId": request["requestId"]})
+                result["idempotent"] = True
+                return {"session": session_summary(session, board["runs"]), "reclaim": result}
+            if session.get("controlMode", "managed") != "external":
+                raise GatewayError("session_not_external", "只有 external Session 可以 reclaim", status=409, request_id=request["requestId"])
+            if session.get("runtimeStatus") != "idle":
+                raise GatewayError("session_not_idle", "只有 idle external Session 可以 reclaim", status=409, request_id=request["requestId"])
+            result = {"status": "completed", "requestId": request["requestId"]}
+            session.update({"controlMode": "managed", "requestedControlMode": "managed", "handoffStatus": None, "handoffRequestId": None, "handoffResult": None, "lastReclaimRequestId": request["requestId"], "lastReclaimResult": result, "updatedAt": now_iso()})
+            self.store.save(board)
+            return {"session": session_summary(session, board["runs"]), "reclaim": result}
 
     def put_session(self, session_id: str, payload: Any) -> dict[str, Any]:
         record = validate_session_config(session_id, payload)
@@ -180,6 +291,11 @@ class GatewayService:
                 for run in board["runs"]
             ):
                 raise GatewayError("session_busy", "运行中的 Session 配置不能修改", status=409)
+            previous = board["sessions"].get(session_id)
+            if isinstance(previous, dict):
+                for key in ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "runtimeStatus", "activeTurnId", "effectivePolicy", "policySource", "policyUpdatedAt"):
+                    if key in previous:
+                        record[key] = previous[key]
             board["sessions"][session_id] = record
             self.store.save(board)
             return {"session": session_summary(record, board["runs"])}
@@ -417,6 +533,15 @@ class GatewayService:
                 self.store.save(board)
             return run_status(run)
 
+    def _handoff_response(self, board: dict[str, Any], session_id: str, request_id: str, *, idempotent: bool = False, result: dict[str, Any] | None = None) -> dict[str, Any]:
+        session = board["sessions"].get(session_id, {})
+        pending = self._pending_for_session(board, session)
+        result = dict(result or session.get("handoffResult") or {"status": session.get("handoffStatus", "pending"), "requestId": request_id})
+        result.setdefault("requestId", request_id)
+        if idempotent:
+            result["idempotent"] = True
+        return {"session": session_summary(session, board["runs"], pending_approval_count=len(pending)), "pendingApprovals": pending, "handoff": result}
+
     def _set_terminal(self, gateway_run_id: str, status: str, error: str | None) -> dict[str, Any]:
         if status not in TERMINAL_RUN_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
@@ -427,7 +552,14 @@ class GatewayService:
                 run.update({"status": status, "updatedAt": timestamp, "terminalAt": timestamp, "error": error})
                 session = board["sessions"].get(run["sessionId"])
                 if isinstance(session, dict) and session.get("activeTurnId") == run.get("transportTurnId"):
-                    session.update({"runtimeStatus": "idle", "activeTurnId": None, "updatedAt": timestamp})
+                    if run.get("handoffRequestId") and status == "interrupted":
+                        result = {"status": "completed", "requestId": run.get("handoffRequestId")}
+                        session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "runtimeStatus": "idle", "activeTurnId": None, "handoffResult": result, "lastHandoffRequestId": run.get("handoffRequestId"), "lastHandoffResult": result, "updatedAt": timestamp})
+                    elif run.get("handoffRequestId"):
+                        result = {"status": "failed", "requestId": run.get("handoffRequestId")}
+                        session.update({"controlMode": "managed", "requestedControlMode": "managed", "handoffStatus": "failed", "runtimeStatus": "idle", "activeTurnId": None, "handoffResult": result, "lastHandoffRequestId": run.get("handoffRequestId"), "lastHandoffResult": result, "updatedAt": timestamp})
+                    else:
+                        session.update({"runtimeStatus": "idle", "activeTurnId": None, "updatedAt": timestamp})
                 self.store.save(board)
             return run_status(run)
 

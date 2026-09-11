@@ -65,6 +65,25 @@ class ImmediateTerminalTransport(FakeTransport):
         return {"transportTurnId": turn_id, "processId": 1}
 
 
+class DeferredInterruptTransport(FakeTransport):
+    def interrupt_turn(self, params):
+        self.interrupts.append(params)
+        return {"status": "acknowledged"}
+
+
+class UnknownInterruptTransport(DeferredInterruptTransport):
+    def interrupt_turn(self, params):
+        self.interrupts.append(params)
+        raise TransportOutcomeUnknown("interrupt outcome unknown")
+
+
+class CallbackThenRaiseTransport(FakeTransport):
+    def interrupt_turn(self, params):
+        self.interrupts.append(params)
+        self.callbacks[params["transportTurnId"]]("interrupted", None)
+        raise RuntimeError("late transport error")
+
+
 def session_config() -> dict:
     return {
         "sessionId": SESSION_ID,
@@ -107,6 +126,109 @@ class GatewayServiceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(GatewayError, "不同的 StartRun"):
             self.gateway.start_run({**payload, "prompt": "被替换的报告"})
+
+    def test_session_detail_projects_policy_and_pending_decisions(self) -> None:
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID]["effectivePolicy"] = {"sandboxPolicy": "workspace-write"}
+            board["pendingApprovals"] = {"29": {"requestId": 29, "method": "item/commandExecution/requestApproval", "params": {"threadId": "thread-coder-1", "turnId": "turn-1", "availableDecisions": ["accept"]}}}
+            self.gateway.store.save(board)
+        detail = self.gateway.get_session(SESSION_ID)
+        self.assertEqual(detail["session"]["requestedPolicy"]["permissionProfileId"], ":workspace")
+        self.assertEqual(detail["session"]["effectivePolicy"], {"sandboxPolicy": "workspace-write"})
+        self.assertEqual(detail["pendingApprovals"][0]["requestId"], 29)
+        self.assertEqual(detail["pendingApprovals"][0]["availableDecisions"], ["accept"])
+        self.assertEqual(self.gateway.list_sessions()["sessions"][0]["pendingApprovalCount"], 1)
+
+    def test_handoff_request_id_is_idempotent_and_unknown_is_fail_closed(self) -> None:
+        transport = DeferredInterruptTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway.start_run({"requestId": "handoff-start", "sessionId": SESSION_ID, "prompt": "交接"})
+        first = gateway.handoff(SESSION_ID, {"requestId": "handoff-1"})
+        second = gateway.handoff(SESSION_ID, {"requestId": "handoff-1"})
+        self.assertEqual(first["handoff"]["status"], "pending")
+        self.assertTrue(second["handoff"]["idempotent"])
+        self.assertEqual(len(transport.interrupts), 1)
+        with self.assertRaisesRegex(GatewayError, "另一个 handoff"):
+            gateway.handoff(SESSION_ID, {"requestId": "handoff-2"})
+
+        unknown_transport = UnknownInterruptTransport()
+        unknown_store = JsonGatewayStore(Path(self.temporary.name) / "unknown.json")
+        unknown_gateway = GatewayService(unknown_store, unknown_transport)
+        unknown_gateway.put_session(SESSION_ID, session_config())
+        unknown_gateway.start_run({"requestId": "unknown-start", "sessionId": SESSION_ID, "prompt": "未知"})
+        with self.assertRaisesRegex(GatewayError, "结果未知"):
+            unknown_gateway.handoff(SESSION_ID, {"requestId": "handoff-3"})
+        self.assertEqual(unknown_gateway.get_session(SESSION_ID)["session"]["status"], "unknown")
+        with self.assertRaisesRegex(GatewayError, "另一个 handoff"):
+            unknown_gateway.handoff(SESSION_ID, {"requestId": "handoff-4"})
+
+    def test_handoff_active_waits_for_terminal_then_reclaim(self) -> None:
+        transport = DeferredInterruptTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        started = gateway.start_run({"requestId": "handoff-start", "sessionId": SESSION_ID, "prompt": "交接"})
+        run_id = started["run"]["gatewayRunId"]
+        pending = gateway.handoff(SESSION_ID, {"requestId": "handoff-1"})
+        self.assertEqual(pending["handoff"]["status"], "pending")
+        self.assertEqual(gateway.get_session(SESSION_ID)["session"]["controlMode"], "managed")
+        transport.callbacks["fake-1"]("interrupted", None)
+        detail = gateway.get_session(SESSION_ID)
+        self.assertEqual(detail["session"]["controlMode"], "external")
+        self.assertEqual(detail["session"]["runtimeStatus"], "idle")
+        reclaimed = gateway.reclaim(SESSION_ID, {"requestId": "reclaim-1"})
+        self.assertEqual(reclaimed["session"]["controlMode"], "managed")
+        self.assertEqual(gateway.get_run(run_id)["run"]["status"], "interrupted")
+
+    def test_natural_terminal_clears_pending_handoff_without_external_claim(self) -> None:
+        transport = DeferredInterruptTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway.start_run({"requestId": "natural-start", "sessionId": SESSION_ID, "prompt": "自然终止"})
+        gateway.handoff(SESSION_ID, {"requestId": "natural-handoff"})
+        transport.callbacks["fake-1"]("completed", None)
+        detail = gateway.get_session(SESSION_ID)["session"]
+        self.assertEqual(detail["controlMode"], "managed")
+        self.assertEqual(detail["requestedControlMode"], "managed")
+        self.assertEqual(detail["handoffStatus"], "failed")
+
+    def test_callback_success_wins_over_late_interrupt_exception(self) -> None:
+        transport = CallbackThenRaiseTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway.start_run({"requestId": "late-start", "sessionId": SESSION_ID, "prompt": "late"})
+        result = gateway.handoff(SESSION_ID, {"requestId": "late-handoff"})
+        self.assertEqual(result["session"]["controlMode"], "external")
+        self.assertEqual(gateway.get_session(SESSION_ID)["session"]["handoffStatus"], "completed")
+
+    def test_registry_put_preserves_authoritative_external_runtime(self) -> None:
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID].update({"controlMode": "external", "runtimeStatus": "idle", "requestedControlMode": "external", "handoffStatus": "completed", "effectivePolicy": {"sandboxPolicy": "read-only"}})
+            self.gateway.store.save(board)
+        self.gateway.put_session(SESSION_ID, session_config())
+        detail = self.gateway.get_session(SESSION_ID)["session"]
+        self.assertEqual(detail["controlMode"], "external")
+        self.assertEqual(detail["runtimeStatus"], "idle")
+        self.assertEqual(detail["effectivePolicy"], {"sandboxPolicy": "read-only"})
+
+    def test_handoff_idle_and_reclaim_active_are_explicit(self) -> None:
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID]["runtimeStatus"] = "idle"
+            self.gateway.store.save(board)
+        completed = self.gateway.handoff(SESSION_ID, {"requestId": "handoff-idle"})
+        self.assertEqual(completed["handoff"]["status"], "completed")
+        retry = self.gateway.handoff(SESSION_ID, {"requestId": "handoff-idle"})
+        self.assertTrue(retry["handoff"]["idempotent"])
+        self.assertEqual(retry["handoff"]["status"], "completed")
+        reclaimed = self.gateway.reclaim(SESSION_ID, {"requestId": "reclaim-idle"})
+        self.assertEqual(reclaimed["session"]["controlMode"], "managed")
+        reclaim_retry = self.gateway.reclaim(SESSION_ID, {"requestId": "reclaim-idle"})
+        self.assertTrue(reclaim_retry["reclaim"]["idempotent"])
+        self.gateway.put_session(SESSION_ID, session_config())
+        late_handoff = self.gateway.handoff(SESSION_ID, {"requestId": "handoff-idle"})
+        self.assertTrue(late_handoff["handoff"]["idempotent"])
+        self.assertEqual(late_handoff["session"]["controlMode"], "managed")
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID].update({"controlMode": "external", "runtimeStatus": "active", "activeTurnId": "external-turn"})
+            self.gateway.store.save(board)
+        with self.assertRaisesRegex(GatewayError, "只有 idle"):
+            self.gateway.reclaim(SESSION_ID, {"requestId": "reclaim-active"})
 
     def test_fast_terminal_does_not_reactivate_session(self) -> None:
         transport = ImmediateTerminalTransport()
@@ -337,6 +459,13 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(updated["session"]["sessionId"], SESSION_ID)
+        status, detail = self.request(f"/v1/sessions/{SESSION_ID}")
+        self.assertEqual(status, 200)
+        self.assertIn("requestedPolicy", detail["session"])
+        self.assertEqual(detail["pendingApprovals"], [])
+        status, error = self.request("/v1/sessions/missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(error["error"], "session_not_found")
         status, sessions = self.request("/v1/sessions")
         self.assertEqual(status, 200)
         self.assertNotIn("threadId", sessions["sessions"][0])

@@ -98,13 +98,15 @@ POST /v1/runs/{gatewayRunId}/interrupt
 }
 ```
 
-固定错误包括 `validation_error`、`session_not_found`、`session_unavailable`、`session_busy`、`request_id_conflict`、`run_not_found`、`run_not_active`、`run_not_interruptible`、`run_start_failed`、`interrupt_in_progress` 和 `interrupt_failed`。
+固定错误包括 `validation_error`、`session_not_found`、`session_unavailable`、`session_busy`、`session_external`、`session_not_idle`、`session_not_external`、`session_not_interruptible`、`handoff_in_progress`、`handoff_unknown`、`request_id_conflict`、`run_not_found`、`run_not_active`、`run_not_interruptible`、`run_start_failed`、`handoff_failed`、`interrupt_in_progress` 和 `interrupt_failed`。HTTP handler 对 handoff/reclaim 的非法输入返回 422，状态冲突返回 409，确定性 transport 失败返回 502。
 
 ## Session 配置入口
 
 `PUT /v1/sessions/{sessionId}` 是 Board/迁移工具使用的内部入口，提交完整的 `sessionId/owner/role/threadId/cwd/model/effort/approvalPolicy/sandboxPolicy/enabled/unavailableReason`。存在占用 Run 时返回 `409 session_busy`。
 
-Runtime 接口还包括 `GET /v1/sessions/{sessionId}/history`、`POST /v1/runs/{gatewayRunId}/steer` 和 `POST /v1/approvals/{requestId}/decision`。Session summary 会投影 `controlMode`、`runtimeStatus`、`activeTurnId` 及 requested/effective policy；`external` 由 App Server 运行事件触发，Gateway 不会后台抢回控制。
+Runtime 接口还包括 `GET /v1/sessions/{sessionId}/history`、`GET /v1/sessions/{sessionId}`、`POST /v1/runs/{gatewayRunId}/steer` 和 `POST /v1/approvals/{requestId}/decision`。Detail 会投影 `controlMode`、`requestedControlMode`、`runtimeStatus`、`activeTurnId`、requested/effective policy 及按 Session 过滤的 pending approvals；审批的 `availableDecisions` 只来自 App Server 请求中 Gateway 支持的决定，未声明能力时不虚构决定。`external` 由 App Server 运行事件触发，Gateway 不会后台抢回控制。
+
+`POST /v1/sessions/{sessionId}/handoff` 使用 `{requestId}`。managed+idle 立即切换为 external；managed+active 先记录 `requestedControlMode=external`、返回 `handoff.status=pending` 并发送 interrupt，只有既有 terminal callback 报告 `interrupted` 后才切换 external/idle。`POST /v1/sessions/{sessionId}/reclaim` 只允许 external+idle，切回 managed 且不重放 prompt。状态冲突返回 409，未知 Session 返回 404，输入错误返回 422。
 
 ## 已知延后
 

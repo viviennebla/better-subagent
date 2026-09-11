@@ -8,13 +8,18 @@
 
 - `GET /health`
 - `GET /v1/sessions`
+- `GET /v1/sessions/{sessionId}`（runtime/control、policy、pending approvals）
 - `PUT /v1/sessions/{sessionId}`
 - `GET /v1/sessions/{sessionId}/history`
+- `POST /v1/sessions/{sessionId}/handoff`
+- `POST /v1/sessions/{sessionId}/reclaim`
 - `POST /v1/runs`
 - `GET /v1/runs/{gatewayRunId}`
 - `POST /v1/runs/{gatewayRunId}/steer`
 - `POST /v1/runs/{gatewayRunId}/interrupt`
 - `POST /v1/approvals/{requestId}/decision`
+
+Session detail exposes only the control/runtime summary and a bounded approval projection (`requestId`, method, session/turn IDs, supported decisions, status). `handoff` is terminal-event driven: an active managed Session remains managed while interrupting and becomes external only after an `interrupted` terminal event. Unknown transport outcomes remain `unknown` and are not retried automatically.
 
 完整合同见 [`docs/BETTER-SUBAGENT-CONTRACT.md`](docs/BETTER-SUBAGENT-CONTRACT.md)。
 

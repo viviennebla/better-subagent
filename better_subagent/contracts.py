@@ -232,27 +232,52 @@ def validate_approval_decision(value: Any) -> dict[str, Any]:
     return {"requestId": text(value.get("requestId", ""), "requestId", 160), "decision": decision, "grantedPermissions": permissions}
 
 
-def session_summary(session: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Any]:
+def validate_session_control(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise GatewayError("validation_error", "Session control 请求必须是对象", status=422)
+    unknown = set(value) - {"requestId"}
+    if unknown:
+        raise GatewayError("validation_error", f"Session control 不支持字段: {', '.join(sorted(unknown))}", status=422)
+    return {"requestId": text(value.get("requestId", ""), "requestId", 160)}
+
+
+def session_summary(session: dict[str, Any], runs: list[dict[str, Any]], *, pending_approval_count: int = 0) -> dict[str, Any]:
     busy = any(
         run.get("sessionId") == session.get("sessionId") and run.get("status") in OCCUPYING_RUN_STATUSES
         for run in runs
     )
     enabled = bool(session.get("enabled", True))
+    runtime = session.get("runtimeStatus", "notLoaded")
+    if not enabled:
+        public_status = "unavailable"
+    elif session.get("controlMode") == "external" and runtime == "active":
+        public_status = "external"
+    elif runtime in {"unknown", "systemError"}:
+        public_status = "unknown"
+    elif runtime == "waitingOnApproval":
+        public_status = "waitingOnApproval"
+    elif busy:
+        public_status = "busy"
+    else:
+        public_status = "idle"
     return {
         "sessionId": session["sessionId"],
         "owner": session["owner"],
         "role": session["role"],
-        "status": "external" if session.get("controlMode") == "external" and session.get("runtimeStatus") == "active" else "busy" if busy else "idle" if enabled else "unavailable",
+        "status": public_status,
         "busy": busy,
         "unavailableReason": "" if enabled else session.get("unavailableReason", ""),
         "updatedAt": session["updatedAt"],
         "controlMode": session.get("controlMode", "managed"),
+        "requestedControlMode": session.get("requestedControlMode"),
+        "handoffStatus": session.get("handoffStatus"),
         "runtimeStatus": session.get("runtimeStatus", "notLoaded"),
         "activeTurnId": session.get("activeTurnId"),
         "requestedPolicy": session.get("requestedPolicy"),
         "effectivePolicy": session.get("effectivePolicy"),
         "policySource": session.get("policySource", "default"),
         "policyUpdatedAt": session.get("policyUpdatedAt"),
+        "pendingApprovalCount": pending_approval_count,
     }
 
 
