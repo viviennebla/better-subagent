@@ -197,6 +197,36 @@ class GatewayServiceTest(unittest.TestCase):
         self.assertEqual(gateway.store.read()["pendingApprovals"]["approval-3"]["status"], "responseUnknown")
         self.assertEqual(len(outcomes), 1)
 
+    def test_approval_uses_original_jsonrpc_request_id_type(self) -> None:
+        class ApprovalTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.received = []
+            def respond_approval(self, *args, **kwargs):
+                self.received.append(args[0])
+        transport = ApprovalTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway._on_approval_request(29, {"threadId": "thread-coder-1", "_requestMethod": "item/commandExecution/requestApproval"})
+        gateway.approval_decision("29", {"requestId": "29", "decision": "accept"})
+        self.assertEqual(transport.received, [29])
+
+    def test_external_matching_completed_turn_becomes_idle_without_reclaim(self) -> None:
+        session = self.gateway.store.read()["sessions"][SESSION_ID]
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID].update({"controlMode": "external", "runtimeStatus": "active", "activeTurnId": "turn-external"})
+            self.gateway.store.save(board)
+        self.gateway._on_transport_notification({"method": "turn/completed", "params": {"threadId": session["threadId"], "turn": {"id": "turn-external", "status": "completed"}}})
+        current = self.gateway.store.read()["sessions"][SESSION_ID]
+        self.assertEqual(current["runtimeStatus"], "idle")
+        self.assertEqual(current["controlMode"], "external")
+        self.assertIsNone(current["activeTurnId"])
+        with self.gateway.store.locked() as board:
+            board["sessions"][SESSION_ID].update({"runtimeStatus": "active", "activeTurnId": "turn-external"})
+            self.gateway.store.save(board)
+        self.gateway._on_transport_notification({"method": "turn/completed", "params": {"threadId": session["threadId"], "turn": {"id": "other-turn", "status": "completed"}}})
+        current = self.gateway.store.read()["sessions"][SESSION_ID]
+        self.assertEqual(current["activeTurnId"], "turn-external")
+
     def test_single_active_run_and_terminal_callback_release_session(self) -> None:
         first = self.gateway.start_run({"requestId": "action-1", "sessionId": SESSION_ID, "prompt": "报告一"})
         with self.assertRaisesRegex(GatewayError, "已有未终结 Run"):

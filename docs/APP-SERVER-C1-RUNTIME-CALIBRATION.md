@@ -82,3 +82,25 @@ read-first 修复已通过首 turn、terminal、steer、interrupt 的最小真�
 - `serverRequest/resolved` 曾出现在通知流；事件方法包含 `turn/started`、`turn/completed`、`thread/status/changed`、`serverRequest/resolved` 等。
 - 已调用 `thread/delete` 返回 `{}`；临时文件未产生，cwd 与一次性探针已删除。
 - Attempt 3：approval **部分通过但 acceptForSession/session scope 未通过**；external **未验证**；idle reconnect **通过**。完整 C1 仍**不通过/条件通过**，不可宣称所有剩余项已完成。
+
+## Attempt 4（目标 `8af77ce`）
+
+按要求仅补 approval 与 external，各使用独立的新 durable 临时 thread；未接 Board/Gateway 部署、未重启服务、未触碰既有 thread。
+
+### Approval：真实 `accept` 也未完成（阻断）
+
+- cwd `/tmp/better-subagent-c1-attempt4-approval`；thread `01a08e73-3d01-7fe2-b1a1-32d0dd678f20`；Gateway Run `run-72023593f4fc4a4baa3c399b3812925d`。
+- pending request：numeric JSON-RPC requestId `29`，method `item/commandExecution/requestApproval`，turn `01a08e73-3dbc-7b91-abbd-8ae34a11918a`；命令只写临时 `approval.txt`。`availableDecisions` 明确支持 `accept`（也支持 amendment/cancel），本次只发送 `accept`。
+- Gateway 返回 `APP_RESPONSE {requestId:"29",decision:"accept"}`，但未收到 `serverRequest/resolved`，文件未生成，terminal 未到达；pending 未消失。最小事实指向 request ID 类型问题：服务端请求 ID 是数值 `29`，Gateway 路径/存储将其字符串化后，`AppServerTransport.respond_approval` 回发 JSON-RPC id `"29"`，可能导致响应无法匹配。未修改代码、未重试或扩大权限。
+- **Verdict：approval blocker，C1 不通过。** `acceptForSession` 不应继续测试；Attempt 3 已证明其不在 command approval 的 `availableDecisions` 中。
+
+### External：通过（active projection / no抢占）
+
+- 独立 cwd `/tmp/better-subagent-c1-attempt4-external`；thread `01a08e74-05a2-7cb0-87ea-967d651acc2c`；第二 client turn `01a08e74-0684-7791-9fd9-8a6de3518cbf`。
+- Gateway 无 managed run 时，client B 启动最短可控 turn；client A 收到 `thread/status/changed`、`turn/started` 等事件，Gateway snapshot 为 `controlMode=external`、`runtimeStatus=active`、`activeTurnId` 正确，未抢占/未拒绝。
+- B 发送 `turn/interrupt` 返回 `{}`；Gateway snapshot 随后仍为 `external/active`，说明 external terminal 后的 idle 投影尚未实现或未在本次事件路径更新；该残余行为需后续修复/校准。
+- **Verdict：external active projection 通过；external→idle 投影未通过/未验证。**
+
+### Attempt 4 清理
+
+两个 thread 均调用 `thread/delete` 返回 `{}`；两个临时 cwd、文件和一次性探针已删除。完整 C1 仍不通过，核心阻断是 approval response 未被 App Server 解析；Attempt 2 的首 turn/terminal/steer/interrupt 与 Attempt 4 的 external active projection 可保留为已证实事实。

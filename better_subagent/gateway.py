@@ -119,6 +119,20 @@ class GatewayService:
                                 session.update({"runtimeStatus": "active", "updatedAt": now_iso()})
                     self.store.save(board)
             return
+        if method == "turn/completed":
+            turn = params.get("turn") or {}
+            turn_id = turn.get("id")
+            thread_id = params.get("threadId")
+            with self.store.locked() as board:
+                for session in board["sessions"].values():
+                    if (
+                        session.get("controlMode") == "external"
+                        and session.get("threadId") == thread_id
+                        and session.get("activeTurnId") == turn_id
+                    ):
+                        session.update({"runtimeStatus": "idle", "activeTurnId": None, "updatedAt": now_iso()})
+                self.store.save(board)
+            return
         if method not in {"turn/started", "thread/status/changed", "transport/status"}:
             return
         status = params.get("status") or params.get("threadStatus")
@@ -341,7 +355,7 @@ class GatewayService:
                 self.store.save(board)
                 pending_method = pending.get("method")
                 pending_params = pending.get("params")
-            responder(request_id, request["decision"], permissions=request.get("grantedPermissions"), method=pending_method, params=pending_params)
+            responder(pending.get("requestId", request_id), request["decision"], permissions=request.get("grantedPermissions"), method=pending_method, params=pending_params)
         except GatewayError:
             raise
         except Exception as exc:
