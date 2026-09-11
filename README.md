@@ -2,7 +2,7 @@
 
 `better-subagent` 是面向 Codex Session 的轻量 Gateway。它把 Session 注册、单活 Run、启动、状态查询和打断从 Web Ledger 中抽离出来，让 Board 只处理 Task、人工调度和业务状态。
 
-当前实现已完成 App Server transport/runtime 的静态 review，默认连接 GUI-managed Codex App Server；仍需 C1 runtime calibration。SDK worker 保留为配置级回退。方案与校准边界见 [`docs/APP-SERVER-NEXT-ROUND-PLAN.md`](docs/APP-SERVER-NEXT-ROUND-PLAN.md)。
+App Server C1 MVP 已在 Codex 0.154.0 的 GUI-managed Unix WebSocket 上完成真实 runtime calibration；当前已具备 history、start、steer、interrupt、运行时审批以及 managed/external handoff/reclaim，并进入 Phase 2 Board adapter 接入。SDK worker 保留为配置级回退；自动重连恢复、分页 history 和完整 settings/effective policy 投影继续延期。方案与校准边界见 [`docs/APP-SERVER-NEXT-ROUND-PLAN.md`](docs/APP-SERVER-NEXT-ROUND-PLAN.md)。
 
 ## 当前接口
 
