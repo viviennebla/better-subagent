@@ -24,6 +24,20 @@ class FakeTransport:
         self.starts: list[dict] = []
         self.interrupts: list[dict] = []
         self.callbacks: dict[str, object] = {}
+        self.thread_read_calls: list[dict] = []
+        self.thread_list_calls: list[dict] = []
+        self.turn_list_calls: list[dict] = []
+        self.threads: list[dict] = [{
+            "id": "thread-coder-1",
+            "sessionId": SESSION_ID,
+            "name": "Registered session",
+            "preview": "registered preview",
+            "status": {"type": "idle"},
+            "cwd": "/tmp/worktree",
+            "source": "appServer",
+            "updatedAt": 100,
+        }]
+        self.turn_pages: dict[str | None, dict] = {None: {"data": [], "nextCursor": None}}
 
     def start_turn(self, params, on_terminal):
         self.starts.append(params)
@@ -41,7 +55,16 @@ class FakeTransport:
         self.callbacks[turn_id]("completed", None)
 
     def read_thread(self, thread_id: str, *, include_turns: bool = True):
+        self.thread_read_calls.append({"threadId": thread_id, "includeTurns": include_turns})
         return {"thread": {"id": thread_id, "status": {"type": "idle"}, "turns": [] if include_turns else None}}
+
+    def list_threads(self, *, limit: int = 100):
+        self.thread_list_calls.append({"limit": limit})
+        return {"data": list(self.threads), "nextCursor": None}
+
+    def list_thread_turns(self, thread_id: str, *, cursor: str | None = None, limit: int = 3):
+        self.turn_list_calls.append({"threadId": thread_id, "cursor": cursor, "limit": limit})
+        return self.turn_pages.get(cursor, {"data": [], "nextCursor": None})
 
 
 class BlockingInterruptTransport(FakeTransport):
@@ -141,6 +164,113 @@ class GatewayServiceTest(unittest.TestCase):
         self.assertEqual(detail["pendingApprovals"][0]["requestId"], 29)
         self.assertEqual(detail["pendingApprovals"][0]["availableDecisions"], ["accept"])
         self.assertEqual(self.gateway.list_sessions()["sessions"][0]["pendingApprovalCount"], 1)
+
+    def test_sessions_overview_merges_registry_and_normalizes_display_status(self) -> None:
+        self.transport.threads = [
+            {
+                "id": SESSION_ID, "sessionId": SESSION_ID, "name": "Primary work",
+                "preview": "older prompt", "status": {"type": "active", "activeFlags": []},
+                "cwd": "/tmp/worktree", "source": "appServer", "updatedAt": 300,
+            },
+            {
+                "id": "unregistered-idle", "sessionId": "unregistered-idle", "name": None,
+                "preview": "Investigate the latest runtime behavior", "status": {"type": "idle"},
+                "cwd": "/tmp/idle", "source": "vscode", "updatedAt": 200,
+            },
+            {
+                "id": "unregistered-not-loaded", "sessionId": "unregistered-not-loaded", "name": "",
+                "preview": "x" * 160, "status": {"type": "notLoaded"},
+                "cwd": "/tmp/stored", "source": "cli", "updatedAt": 100,
+            },
+        ]
+        result = self.gateway.sessions_overview()
+        self.assertEqual([item["sessionId"] for item in result["sessions"]], [
+            SESSION_ID, "unregistered-idle", "unregistered-not-loaded",
+        ])
+        registered, idle, not_loaded = result["sessions"]
+        self.assertEqual(registered["status"], "active")
+        self.assertEqual(registered["runtimeStatus"], "active")
+        self.assertEqual(registered["mainWork"], "Primary work")
+        self.assertTrue(registered["registered"])
+        self.assertEqual(registered["owner"], "coder-1")
+        self.assertEqual(registered["role"], "coder")
+        self.assertEqual(idle["status"], "idle")
+        self.assertFalse(idle["registered"])
+        self.assertEqual(idle["controlMode"], "external")
+        self.assertEqual(idle["name"], "Investigate the latest runtime behavior")
+        self.assertEqual(not_loaded["status"], "idle")
+        self.assertEqual(not_loaded["runtimeStatus"], "notLoaded")
+        self.assertEqual(len(not_loaded["mainWork"]), 120)
+
+    def test_sessions_overview_deduplicates_thread_id_and_keeps_newest_row(self) -> None:
+        self.transport.threads = [
+            {
+                "id": "thread-duplicate", "sessionId": "session-root", "name": "newest",
+                "preview": "new", "status": {"type": "active", "activeFlags": []},
+                "cwd": "/tmp/new", "source": "vscode", "updatedAt": 300,
+            },
+            {
+                "id": "thread-other", "sessionId": "thread-other", "name": "other",
+                "preview": "other", "status": {"type": "idle"},
+                "cwd": "/tmp/other", "source": "cli", "updatedAt": 250,
+            },
+            {
+                "id": "thread-duplicate", "sessionId": "session-root", "name": "stale",
+                "preview": "old", "status": {"type": "idle"},
+                "cwd": "/tmp/old", "source": "vscode", "updatedAt": 100,
+            },
+        ]
+        sessions = self.gateway.sessions_overview()["sessions"]
+        self.assertEqual([item["sessionId"] for item in sessions], ["thread-duplicate", "thread-other"])
+        self.assertEqual(sessions[0]["sessionRootId"], "session-root")
+        self.assertEqual(sessions[0]["name"], "newest")
+        self.assertEqual(sessions[0]["status"], "active")
+
+    def test_session_recap_skips_active_turn_and_reads_one_more_page(self) -> None:
+        self.transport.turn_pages = {
+            None: {
+                "data": [{"id": "turn-active", "status": "inProgress", "items": []}],
+                "nextCursor": "older-page",
+            },
+            "older-page": {
+                "data": [{
+                    "id": "turn-complete", "status": "completed",
+                    "items": [
+                        {"id": "user-1", "type": "userMessage", "content": []},
+                        {"id": "agent-1", "type": "agentMessage", "text": "draft"},
+                        {"id": "agent-2", "type": "agentMessage", "text": "final result"},
+                    ],
+                }],
+                "nextCursor": "unused-third-page",
+            },
+        }
+        result = self.gateway.session_recap(SESSION_ID)
+        self.assertEqual(result, {
+            "sessionId": SESSION_ID,
+            "recap": "final result",
+            "source": "completedTurn",
+            "turnId": "turn-complete",
+        })
+        self.assertEqual(self.transport.turn_list_calls, [
+            {"threadId": "thread-coder-1", "cursor": None, "limit": 3},
+            {"threadId": "thread-coder-1", "cursor": "older-page", "limit": 3},
+        ])
+        self.assertEqual(self.transport.thread_read_calls, [])
+
+    def test_session_recap_falls_back_to_preview_or_empty(self) -> None:
+        class BrokenRecapTransport(FakeTransport):
+            def list_thread_turns(self, thread_id, *, cursor=None, limit=3):
+                raise RuntimeError("turn list unavailable")
+
+        transport = BrokenRecapTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        preview = gateway.session_recap(SESSION_ID)
+        self.assertEqual(preview["recap"], "registered preview")
+        self.assertEqual(preview["source"], "preview")
+        transport.threads[0]["preview"] = ""
+        empty = gateway.session_recap(SESSION_ID)
+        self.assertEqual(empty["recap"], "")
+        self.assertEqual(empty["source"], "empty")
 
     def test_handoff_request_id_is_idempotent_and_unknown_is_fail_closed(self) -> None:
         transport = DeferredInterruptTransport()
@@ -475,6 +605,15 @@ class GatewayHttpTest(unittest.TestCase):
         status, sessions = self.request("/v1/sessions")
         self.assertEqual(status, 200)
         self.assertNotIn("threadId", sessions["sessions"][0])
+        status, overview = self.request("/v1/sessions/overview")
+        self.assertEqual(status, 200)
+        self.assertEqual(overview["sessions"][0]["sessionId"], "thread-coder-1")
+        self.assertEqual(overview["sessions"][0]["sessionRootId"], SESSION_ID)
+        self.assertTrue(overview["sessions"][0]["registered"])
+        status, recap = self.request(f"/v1/sessions/{SESSION_ID}/recap")
+        self.assertEqual(status, 200)
+        self.assertEqual(recap["recap"], "registered preview")
+        self.assertEqual(recap["source"], "preview")
         status, started = self.request("/v1/runs", method="POST", payload={
             "requestId": "http-action", "sessionId": SESSION_ID, "prompt": "交接"
         })

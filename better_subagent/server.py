@@ -31,7 +31,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/v1/sessions":
             self._handle(lambda _payload: self.gateway.list_sessions(), HTTPStatus.OK, body=False)
             return
+        if path == "/v1/sessions/overview":
+            self._handle(lambda _payload: self.gateway.sessions_overview(), HTTPStatus.OK, body=False)
+            return
         session_prefix = "/v1/sessions/"
+        if path.startswith(session_prefix) and path.endswith("/recap"):
+            session_id = unquote(path[len(session_prefix):-len("/recap")].rstrip("/"))
+            self._handle(lambda _payload: self.gateway.session_recap(session_id), HTTPStatus.OK, body=False)
+            return
         if path.startswith(session_prefix) and len(path) > len(session_prefix) and "/" not in path[len(session_prefix):]:
             session_id = unquote(path[len(session_prefix):])
             self._handle(lambda _payload: self.gateway.get_session(session_id), HTTPStatus.OK, body=False)

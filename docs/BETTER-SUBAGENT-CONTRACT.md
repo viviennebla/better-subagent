@@ -26,6 +26,12 @@ better-subagent 是 Codex Session Gateway。它独占 Session runtime 配置、S
 
 `status` 为 `idle | busy | unavailable`。`busy` 由 Gateway Run 推导，调用方不能写入。
 
+### Session overview 与 recap
+
+`GET /v1/sessions/overview` 直接读取 Codex App Server `thread/list` 的最新 100 条 thread，不改变 `GET /v1/sessions` 的控制注册表合同。结果按 Thread `id` 去重并保留倒序首项；公开 `sessionId` 与 `threadId` 均使用可直接控制的 Thread `id`，App Server 可在 session tree 内共享的 `thread.sessionId` 单独返回为 `sessionRootId`。每项还包含 `name/mainWork/preview/status/runtimeStatus/cwd/source/updatedAt/owner/role/registered/controlMode`；registry 按 key 或配置的 `threadId` 合并。`active` 映射为展示状态 `active`，包括 `notLoaded` 在内的其他状态映射为 `idle`，同时保留原始 `runtimeStatus`。未注册 thread 也会返回，`registered=false`、`controlMode=external`。
+
+`GET /v1/sessions/{sessionId}/recap` 使用 `thread/turns/list`，每页最多 3 个 Turn、倒序、`itemsView=summary`。它跳过活跃 Turn，返回最近 completed Turn 的最后一条 `agentMessage.text`；首屏没有 completed 时最多再读取一页。读取失败或没有已完成回复时降级为 thread preview，再无内容则返回空字符串。兼容接口 `/history` 保留。
+
 ## StartRun
 
 ```http

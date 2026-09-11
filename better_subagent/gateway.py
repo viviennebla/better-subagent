@@ -173,6 +173,142 @@ class GatewayService:
         summaries.sort(key=lambda item: (item["role"], item["owner"], item["sessionId"]))
         return {"sessions": summaries}
 
+    def sessions_overview(self) -> dict[str, Any]:
+        lister = getattr(self.transport, "list_threads", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 Session overview", status=501)
+        try:
+            response = lister(limit=100)
+        except Exception as exc:
+            raise GatewayError(
+                "overview_unavailable",
+                "Session overview 读取失败",
+                status=502,
+                details={"reason": str(exc)[:1000]},
+            ) from exc
+        threads = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(threads, list):
+            raise GatewayError("overview_unavailable", "App Server thread/list 响应无效", status=502)
+        registry = self.store.read().get("sessions", {})
+        sessions: list[dict[str, Any]] = []
+        seen_thread_ids: set[str] = set()
+        for thread in threads:
+            if not isinstance(thread, dict) or not isinstance(thread.get("id"), str) or not thread["id"]:
+                continue
+            thread_id = thread["id"]
+            if thread_id in seen_thread_ids:
+                continue
+            seen_thread_ids.add(thread_id)
+            session_id = thread_id
+            session_root_id = thread.get("sessionId") if isinstance(thread.get("sessionId"), str) else thread_id
+            registered = registry.get(session_id)
+            if not isinstance(registered, dict):
+                registered = next(
+                    (
+                        item for item in registry.values()
+                        if isinstance(item, dict) and item.get("threadId") == thread_id
+                    ),
+                    None,
+                )
+            registered = registered if isinstance(registered, dict) else None
+            raw_status = thread.get("status")
+            runtime_status = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
+            if not isinstance(runtime_status, str) or not runtime_status:
+                runtime_status = "notLoaded"
+            preview = thread.get("preview") if isinstance(thread.get("preview"), str) else ""
+            raw_name = thread.get("name") if isinstance(thread.get("name"), str) else ""
+            main_work = raw_name.strip() or preview.strip()[:120]
+            sessions.append({
+                "sessionId": session_id,
+                "sessionRootId": session_root_id,
+                "threadId": thread_id,
+                "name": main_work,
+                "mainWork": main_work,
+                "preview": preview,
+                "status": "active" if runtime_status == "active" else "idle",
+                "runtimeStatus": runtime_status,
+                "cwd": thread.get("cwd") if isinstance(thread.get("cwd"), str) else "",
+                "source": thread.get("source", "unknown"),
+                "updatedAt": thread.get("updatedAt"),
+                "owner": registered.get("owner", "") if registered else "",
+                "role": registered.get("role", "") if registered else "",
+                "registered": registered is not None,
+                "controlMode": registered.get("controlMode", "managed") if registered else "external",
+            })
+        return {"sessions": sessions, "nextCursor": response.get("nextCursor")}
+
+    def session_recap(self, session_id: str) -> dict[str, Any]:
+        registry = self.store.read().get("sessions", {})
+        registered = registry.get(session_id)
+        thread_id = registered.get("threadId") if isinstance(registered, dict) else None
+        preview = ""
+        lister = getattr(self.transport, "list_threads", None)
+        if callable(lister):
+            try:
+                response = lister(limit=100)
+                threads = response.get("data", []) if isinstance(response, dict) else []
+                thread = next(
+                    (
+                        item for item in threads
+                        if isinstance(item, dict)
+                        and item.get("id") == (thread_id if isinstance(thread_id, str) else session_id)
+                    ),
+                    None,
+                )
+                if thread is None:
+                    thread = next(
+                        (
+                            item for item in threads
+                            if isinstance(item, dict) and item.get("sessionId") == session_id
+                        ),
+                        None,
+                    )
+                if isinstance(thread, dict):
+                    if not isinstance(thread_id, str) or not thread_id:
+                        thread_id = thread.get("id")
+                    if isinstance(thread.get("preview"), str):
+                        preview = thread["preview"]
+            except Exception:
+                pass
+        if not isinstance(thread_id, str) or not thread_id:
+            thread_id = session_id
+        turns_lister = getattr(self.transport, "list_thread_turns", None)
+        if callable(turns_lister):
+            cursor: str | None = None
+            try:
+                for _page in range(2):
+                    response = turns_lister(thread_id, cursor=cursor, limit=3)
+                    turns = response.get("data") if isinstance(response, dict) else None
+                    if not isinstance(turns, list):
+                        break
+                    for turn in turns:
+                        if not isinstance(turn, dict) or turn.get("status") != "completed":
+                            continue
+                        messages = [
+                            item.get("text") for item in turn.get("items", [])
+                            if isinstance(item, dict)
+                            and item.get("type") == "agentMessage"
+                            and isinstance(item.get("text"), str)
+                        ]
+                        if messages:
+                            return {
+                                "sessionId": session_id,
+                                "recap": messages[-1],
+                                "source": "completedTurn",
+                                "turnId": turn.get("id"),
+                            }
+                    cursor = response.get("nextCursor")
+                    if not isinstance(cursor, str) or not cursor:
+                        break
+            except Exception:
+                pass
+        return {
+            "sessionId": session_id,
+            "recap": preview,
+            "source": "preview" if preview else "empty",
+            "turnId": None,
+        }
+
     def get_session(self, session_id: str) -> dict[str, Any]:
         board = self.store.read()
         session = board["sessions"].get(session_id)

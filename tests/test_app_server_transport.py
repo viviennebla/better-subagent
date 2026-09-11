@@ -49,6 +49,27 @@ class AppServerTransportTest(unittest.TestCase):
         self.assertEqual(result["thread"]["id"], "thread-fresh")
         self.assertEqual(transport.calls[0], ("thread/read", {"threadId": "thread-fresh", "includeTurns": False}))
 
+    def test_overview_and_recap_list_calls_use_codex_0154_contract(self):
+        transport = FakeAppServerTransport()
+        transport.list_threads(limit=100)
+        transport.list_thread_turns("thread-1", limit=3)
+        transport.list_thread_turns("thread-1", cursor="next-page", limit=3)
+        self.assertEqual(transport.calls[0], (
+            "thread/list",
+            {"limit": 100, "sortKey": "updated_at", "sortDirection": "desc"},
+        ))
+        self.assertEqual(transport.calls[1], (
+            "thread/turns/list",
+            {"threadId": "thread-1", "limit": 3, "sortDirection": "desc", "itemsView": "summary"},
+        ))
+        self.assertEqual(transport.calls[2], (
+            "thread/turns/list",
+            {
+                "threadId": "thread-1", "limit": 3, "sortDirection": "desc",
+                "itemsView": "summary", "cursor": "next-page",
+            },
+        ))
+
     def test_development_default_uses_workspace_profile(self):
         config = validate_session_config("session-1", {"sessionId": "session-1", "owner": "o", "role": "coder", "threadId": "thread-1", "cwd": "/tmp", "model": "m", "effort": "high", "approvalPolicy": "on-request", "sandboxPolicy": "workspace-write", "enabled": True, "unavailableReason": ""})
         self.assertEqual(config["requestedPolicy"]["permissionProfileId"], ":workspace")

@@ -166,6 +166,31 @@ class AppServerTransport:
         self._ensure_connected()
         return self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
 
+    def list_threads(self, *, limit: int = 100) -> dict[str, Any]:
+        self._ensure_connected()
+        return self.request(
+            "thread/list",
+            {"limit": limit, "sortKey": "updated_at", "sortDirection": "desc"},
+        )
+
+    def list_thread_turns(
+        self,
+        thread_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 3,
+    ) -> dict[str, Any]:
+        self._ensure_connected()
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        return self.request("thread/turns/list", params)
+
     def resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.request("thread/resume", params)
 

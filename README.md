@@ -8,7 +8,9 @@ App Server C1 MVP 已在 Codex 0.154.0 的 GUI-managed Unix WebSocket 上完成�
 
 - `GET /health`
 - `GET /v1/sessions`
+- `GET /v1/sessions/overview`（App Server thread 概览，含未注册 Session）
 - `GET /v1/sessions/{sessionId}`（runtime/control、policy、pending approvals）
+- `GET /v1/sessions/{sessionId}/recap`（最近完成 Turn 的最终回复，失败时降级 preview）
 - `PUT /v1/sessions/{sessionId}`
 - `GET /v1/sessions/{sessionId}/history`
 - `POST /v1/sessions/{sessionId}/handoff`
