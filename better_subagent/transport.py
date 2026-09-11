@@ -55,7 +55,8 @@ class AppServerTransport:
         self._turns: dict[str, tuple[TerminalCallback, str]] = {}
         self._notifications: list[NotificationCallback] = []
         self._approval: ApprovalCallback | None = None
-        self._pending_approvals: dict[str, str] = {}
+        self._pending_approvals: dict[str, dict[str, Any] | str] = {}
+        self._approval_responses: set[str] = set()
         self._orphan_terminals: dict[tuple[int, str, str], tuple[str, str | None]] = {}
         self._frame_buffer = bytearray()
         self._message_buffer = bytearray()
@@ -254,7 +255,10 @@ class AppServerTransport:
 
     def respond_approval(self, request_id: str | int, decision: str, *, permissions: dict[str, Any] | None = None, method: str | None = None, params: dict[str, Any] | None = None) -> None:
         with self._lock:
-            method = method or self._pending_approvals.get(str(request_id))
+            pending = self._pending_approvals.get(str(request_id))
+            method = method or (pending.get("method") if isinstance(pending, dict) else pending)
+            if str(request_id) in self._approval_responses:
+                raise TransportRejected("审批响应已发送，等待 serverRequest/resolved")
         if method is None:
             raise TransportRejected("未知或已解决的审批请求")
         cancel_params = params if method == "item/permissions/requestApproval" and decision == "cancel" else None
@@ -278,7 +282,7 @@ class AppServerTransport:
                 "id": request_id,
                 "result": result,
             })
-            self._pending_approvals.pop(str(request_id), None)
+            self._approval_responses.add(str(request_id))
         if cancel_params is not None:
             # The permissions response has no decision field. The interrupt
             # is a separate RPC, deliberately sent after releasing _lock.
@@ -433,13 +437,19 @@ class AppServerTransport:
                     self._orphan_terminals[(generation or self._generation, thread_id, turn_id)] = (status, error.get("message") if isinstance(error, dict) else error)
         if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"}:
             request_id = message.get("id")
-            self._pending_approvals[str(request_id)] = method
+            self._pending_approvals[str(request_id)] = {"method": method, "params": params, "threadId": params.get("threadId")}
             if self._approval is not None:
                 self._approval(request_id, {**params, "_requestMethod": method})
         if method == "serverRequest/resolved":
             request_id = params.get("requestId") or params.get("id")
             if request_id is not None:
-                self._pending_approvals.pop(str(request_id), None)
+                key = str(request_id)
+                pending = self._pending_approvals.get(key)
+                pending_thread = pending.get("threadId") if isinstance(pending, dict) else None
+                resolved_thread = params.get("threadId")
+                if pending_thread is not None and resolved_thread == pending_thread:
+                    self._pending_approvals.pop(key, None)
+                    self._approval_responses.discard(key)
         for callback in self._notifications:
             callback(message)
 

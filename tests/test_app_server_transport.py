@@ -136,12 +136,21 @@ class AppServerTransportTest(unittest.TestCase):
 
     def test_approval_string_id_and_file_scope_are_strict(self):
         transport = FakeAppServerTransport()
-        transport._pending_approvals["approval-1"] = "item/fileChange/requestApproval"
+        transport._pending_approvals["approval-1"] = {"method": "item/fileChange/requestApproval", "threadId": "thread-1", "params": {}}
         captured = []
         transport._send_json = lambda value: captured.append(value)
         transport.respond_approval("approval-1", "acceptForSession")
         self.assertEqual(captured[0]["id"], "approval-1")
         self.assertEqual(captured[0]["result"], {"decision": "acceptForSession"})
+        self.assertIn("approval-1", transport._pending_approvals)
+        transport._handle_notification({"method": "serverRequest/resolved", "params": {"requestId": "approval-1", "threadId": "thread-1"}})
+        self.assertNotIn("approval-1", transport._pending_approvals)
+
+    def test_resolved_wrong_thread_does_not_clear_transport_pending(self):
+        transport = FakeAppServerTransport()
+        transport._pending_approvals["approval-1"] = {"method": "item/fileChange/requestApproval", "threadId": "thread-1", "params": {}}
+        transport._handle_notification({"method": "serverRequest/resolved", "params": {"requestId": "approval-1", "threadId": "thread-2"}})
+        self.assertIn("approval-1", transport._pending_approvals)
 
     def test_three_approval_types_and_decline(self):
         transport = FakeAppServerTransport()
@@ -157,6 +166,14 @@ class AppServerTransportTest(unittest.TestCase):
         self.assertEqual(captured[0]["result"], {"decision": "decline"})
         self.assertEqual(captured[1]["result"], {"decision": "acceptForSession"})
         self.assertEqual(captured[2]["result"], {"permissions": {}, "scope": "turn"})
+
+    def test_permissions_session_scope_ignores_command_available_decisions(self):
+        transport = FakeAppServerTransport()
+        captured = []
+        transport._send_json = lambda value: captured.append(value)
+        transport._pending_approvals["perm"] = {"method": "item/permissions/requestApproval", "params": {"availableDecisions": ["accept"]}}
+        transport.respond_approval("perm", "acceptForSession", permissions={"fullAccess": True})
+        self.assertEqual(captured[0]["result"]["scope"], "session")
 
     def test_permissions_cancel_responds_then_interrupts(self):
         transport = FakeAppServerTransport()

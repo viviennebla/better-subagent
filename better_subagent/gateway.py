@@ -111,10 +111,12 @@ class GatewayService:
             request_id = str(params.get("requestId") or params.get("id") or "")
             if request_id:
                 with self.store.locked() as board:
-                    board.setdefault("pendingApprovals", {}).pop(request_id, None)
-                    for session in board["sessions"].values():
-                        if session.get("runtimeStatus") == "waitingOnApproval" and session.get("threadId") == params.get("threadId"):
-                            session.update({"runtimeStatus": "active", "updatedAt": now_iso()})
+                    pending = board.setdefault("pendingApprovals", {}).get(request_id)
+                    if isinstance(pending, dict) and pending.get("params", {}).get("threadId") == params.get("threadId"):
+                        board["pendingApprovals"].pop(request_id, None)
+                        for session in board["sessions"].values():
+                            if session.get("runtimeStatus") == "waitingOnApproval" and session.get("threadId") == params.get("threadId"):
+                                session.update({"runtimeStatus": "active", "updatedAt": now_iso()})
                     self.store.save(board)
             return
         if method not in {"turn/started", "thread/status/changed", "transport/status"}:
@@ -321,22 +323,34 @@ class GatewayService:
         if responder is None:
             raise GatewayError("transport_unsupported", "当前 transport 不支持审批", status=501)
         try:
-            pending = self.store.read().get("pendingApprovals", {}).get(request_id)
-            if not isinstance(pending, dict):
-                raise GatewayError("approval_not_found", "审批请求不存在或已解决", status=409, request_id=request_id)
-            is_permissions = pending.get("method") == "item/permissions/requestApproval"
-            if is_permissions and request.get("decision") in {"accept", "acceptForSession"} and request.get("grantedPermissions") is None:
-                raise GatewayError("validation_error", "permissions 审批必须提供 grantedPermissions", status=422, request_id=request_id)
-            if not is_permissions and request.get("grantedPermissions") is not None:
-                raise GatewayError("validation_error", "grantedPermissions 只适用于 permissions 审批", status=422, request_id=request_id)
-            responder(request_id, request["decision"], permissions=request.get("grantedPermissions"), method=pending.get("method"), params=pending.get("params"))
+            with self.store.locked() as board:
+                pending = board.setdefault("pendingApprovals", {}).get(request_id)
+                if not isinstance(pending, dict):
+                    raise GatewayError("approval_not_found", "审批请求不存在或已解决", status=409, request_id=request_id)
+                if pending.get("status") in {"responding", "responseUnknown"}:
+                    raise GatewayError("approval_already_responding", "审批响应已发送，等待 App Server 确认", status=409, request_id=request_id)
+                is_permissions = pending.get("method") == "item/permissions/requestApproval"
+                available = pending.get("params", {}).get("availableDecisions") if isinstance(pending.get("params"), dict) else None
+                if not is_permissions and isinstance(available, list) and request["decision"] not in available:
+                    raise GatewayError("approval_decision_unavailable", "当前审批请求不支持该决定", status=409, details={"availableDecisions": available}, request_id=request_id)
+                if is_permissions and request.get("decision") in {"accept", "acceptForSession"} and request.get("grantedPermissions") is None:
+                    raise GatewayError("validation_error", "permissions 审批必须提供 grantedPermissions", status=422, request_id=request_id)
+                if not is_permissions and request.get("grantedPermissions") is not None:
+                    raise GatewayError("validation_error", "grantedPermissions 只适用于 permissions 审批", status=422, request_id=request_id)
+                pending.update({"status": "responding", "decision": request["decision"], "requestedAt": now_iso()})
+                self.store.save(board)
+                pending_method = pending.get("method")
+                pending_params = pending.get("params")
+            responder(request_id, request["decision"], permissions=request.get("grantedPermissions"), method=pending_method, params=pending_params)
         except GatewayError:
             raise
         except Exception as exc:
+            with self.store.locked() as board:
+                pending = board.setdefault("pendingApprovals", {}).get(request_id)
+                if isinstance(pending, dict):
+                    pending.update({"status": "responseUnknown", "error": str(exc)[:1000], "updatedAt": now_iso()})
+                    self.store.save(board)
             raise GatewayError("approval_failed", "审批响应失败", status=502, details={"reason": str(exc)[:1000]}, request_id=request_id) from exc
-        with self.store.locked() as board:
-            board.setdefault("pendingApprovals", {}).pop(request_id, None)
-            self.store.save(board)
         return {"requestId": request_id, "decision": request["decision"]}
 
     def interrupt_run(self, gateway_run_id: str, payload: Any) -> dict[str, Any]:

@@ -125,6 +125,78 @@ class GatewayServiceTest(unittest.TestCase):
         self.assertEqual(board["sessions"][SESSION_ID]["runtimeStatus"], "active")
         self.assertEqual(board["sessions"][second]["runtimeStatus"], "waitingOnApproval")
 
+    def test_approval_available_decisions_and_resolved_fact(self) -> None:
+        class ApprovalTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.responses = []
+            def respond_approval(self, *args, **kwargs):
+                self.responses.append((args, kwargs))
+
+        transport = ApprovalTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        with self.gateway.store.locked() as board:
+            board["pendingApprovals"] = {"approval-1": {"requestId": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"threadId": "thread-coder-1", "availableDecisions": ["accept"]}}}
+            self.gateway.store.save(board)
+        with self.assertRaisesRegex(GatewayError, "不支持") as raised:
+            gateway.approval_decision("approval-1", {"requestId": "approval-1", "decision": "acceptForSession"})
+        self.assertEqual(raised.exception.status, 409)
+        self.assertEqual(transport.responses, [])
+        gateway.approval_decision("approval-1", {"requestId": "approval-1", "decision": "accept"})
+        self.assertEqual(len(transport.responses), 1)
+        self.assertEqual(gateway.store.read()["pendingApprovals"]["approval-1"]["status"], "responding")
+        gateway._on_transport_notification({"method": "serverRequest/resolved", "params": {"requestId": "approval-1", "threadId": "thread-coder-1"}})
+        self.assertNotIn("approval-1", gateway.store.read()["pendingApprovals"])
+
+    def test_responding_approval_cannot_be_sent_twice_or_resolved_cross_thread(self) -> None:
+        class ApprovalTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.responses = 0
+            def respond_approval(self, *args, **kwargs):
+                self.responses += 1
+        transport = ApprovalTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway._on_approval_request("approval-2", {"threadId": "thread-coder-1", "_requestMethod": "item/commandExecution/requestApproval"})
+        gateway.approval_decision("approval-2", {"requestId": "approval-2", "decision": "accept"})
+        with self.assertRaisesRegex(GatewayError, "已发送"):
+            gateway.approval_decision("approval-2", {"requestId": "approval-2", "decision": "accept"})
+        self.assertEqual(transport.responses, 1)
+        gateway._on_transport_notification({"method": "serverRequest/resolved", "params": {"requestId": "approval-2", "threadId": "thread-other"}})
+        self.assertIn("approval-2", gateway.store.read()["pendingApprovals"])
+
+    def test_approval_claim_is_atomic_under_concurrent_requests_and_failure_is_closed(self) -> None:
+        class BlockingApprovalTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.responses = 0
+            def respond_approval(self, *args, **kwargs):
+                self.responses += 1
+                self.entered.set()
+                self.release.wait(1)
+                raise RuntimeError("synthetic response failure")
+        transport = BlockingApprovalTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        gateway._on_approval_request("approval-3", {"threadId": "thread-coder-1", "_requestMethod": "item/commandExecution/requestApproval"})
+        outcomes = []
+        def first():
+            try:
+                gateway.approval_decision("approval-3", {"requestId": "approval-3", "decision": "accept"})
+            except Exception as exc:
+                outcomes.append(exc)
+        worker = threading.Thread(target=first)
+        worker.start()
+        self.assertTrue(transport.entered.wait(1))
+        with self.assertRaisesRegex(GatewayError, "已发送"):
+            gateway.approval_decision("approval-3", {"requestId": "approval-3", "decision": "accept"})
+        transport.release.set()
+        worker.join(timeout=1)
+        self.assertEqual(transport.responses, 1)
+        self.assertEqual(gateway.store.read()["pendingApprovals"]["approval-3"]["status"], "responseUnknown")
+        self.assertEqual(len(outcomes), 1)
+
     def test_single_active_run_and_terminal_callback_release_session(self) -> None:
         first = self.gateway.start_run({"requestId": "action-1", "sessionId": SESSION_ID, "prompt": "报告一"})
         with self.assertRaisesRegex(GatewayError, "已有未终结 Run"):
