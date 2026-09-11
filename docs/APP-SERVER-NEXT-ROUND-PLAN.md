@@ -1,10 +1,10 @@
 # better-subagent App Server 下一轮开发计划
 
-状态：**用户已批准；Phase 0 等待 remote-control 显式授权**
+状态：**用户已批准；C0 有条件通过，Phase 1 执行中**
 
 日期：2026-09-10
 
-批准记录：用户于 2026-09-10 确认按本方案开始；执行采用逐阶段校准，并优先控制 Agent token 消耗。
+批准记录：用户于 2026-09-10 确认按本方案开始；2026-09-11 批准 C0 的默认收敛方案，不再等待其他产品决策。执行采用逐阶段校准，并优先控制 Agent token 消耗。
 
 基线：better-subagent `0.1`、Codex CLI / App Server `0.154.0`
 
@@ -195,7 +195,7 @@ Board 提供“移交到 CLI/GUI”：
 5. daemon 或 Gateway 重启后 thread、turn 和 pending request 的恢复表现；
 6. `vimo-development` profile 与 `acceptForSession` 的真实生效行为。
 
-**Calibrate Gate C0：** 用户审阅事实表，确定“等待审批时无缝移交”还是“打断后移交”。在此之前不冻结相关接口语义。
+**Calibrate Gate C0：已通过。** 用户批准首版采用“打断后移交”；等待审批时不承诺跨 client 无缝接管。GUI 管理的 App Server 直接使用 Unix WebSocket，不要求切换为 daemon-managed 拓扑。
 
 ### Phase 1：App Server transport 与 Gateway runtime
 
