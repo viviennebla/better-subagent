@@ -1,8 +1,8 @@
 # better-subagent App Server 下一轮开发计划
 
-状态：**用户已批准；C0 有条件通过，Phase 1 静态 review 已通过，待 C1 runtime calibration**
+状态：**用户已批准；C0 有条件通过，C1 MVP runtime calibration 已通过，Phase 2 待启动**
 
-日期：2026-09-10
+日期：2026-09-11（C1 MVP runtime calibration 完成）
 
 批准记录：用户于 2026-09-10 确认按本方案开始；2026-09-11 批准 C0 的默认收敛方案，不再等待其他产品决策。执行采用逐阶段校准，并优先控制 Agent token 消耗。
 
@@ -212,9 +212,11 @@ Board 提供“移交到 CLI/GUI”：
 
 Phase 1 静态 review 已覆盖协议 payload、terminal/approval 生命周期、external/unknown 投影与 SDK 回退。以下项目明确延期到后续校准/阶段，不作为本轮已完成能力宣称：自动 reconnect 后恢复并自动调度、分页 history、permission profile discovery、`configRequirements/read` 和完整 `thread/settings/update` effective projection。
 
-**Calibrate Gate C1：** 不接 Board，直接演示同一真实 Session 的 history、start、steer、interrupt、approval 和外部接入识别。
+**Calibrate Gate C1：已通过（MVP）。** 已在不接 Board 的真实 0.154.0 Session 验证 durable history/read-first、start/completed、steer、interrupt/interrupted、command approval `accept`/resolved/completed、第二 client external active→idle 与 idle reconnect。`acceptForSession` 受 request capability 限制；自动 reconnect、active/pending reconnect、分页 history 和完整 settings effective projection 延期。
 
 ### Phase 2：三个模块并行接入
+
+状态：**C1 MVP 通过，可启动；C1 延期项继续作为实现中的明确非目标。**
 
 #### A. Ledger domain / adapter
 
@@ -278,7 +280,7 @@ Phase 1 静态 review 已覆盖协议 payload、terminal/approval 生命周期�
 
 ## 9. Review 时需要确认的两项
 
-1. 默认采用 `:workspace + on-request + auto_review + acceptForSession`；
+1. 默认采用 `:workspace + on-request + auto_review`；`acceptForSession` 仅在 App Server request 的 `availableDecisions` 或 permissions scope 明确支持时显示；
 2. 若 C0 不能证明未决审批可跨 client 接管，首版采用“打断当前 turn 后移交”。
 
 除这两项外，其余阶段可按上述模块边界直接拆任务执行。

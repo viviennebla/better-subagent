@@ -104,3 +104,35 @@ read-first 修复已通过首 turn、terminal、steer、interrupt 的最小真�
 ### Attempt 4 清理
 
 两个 thread 均调用 `thread/delete` 返回 `{}`；两个临时 cwd、文件和一次性探针已删除。完整 C1 仍不通过，核心阻断是 approval response 未被 App Server 解析；Attempt 2 的首 turn/terminal/steer/interrupt 与 Attempt 4 的 external active projection 可保留为已证实事实。
+
+## Attempt 5（目标 `2f8223a`）
+
+### A. Approval：numeric id / accept 闭环通过
+
+- cwd `/tmp/better-subagent-c1-attempt5-approval`；thread `01a08e77-318d-7311-b2b3-eeaabae45584`；Gateway Run `run-3d95ef7e956a4c68b94704889aa8ea4b`。
+- pending 为 numeric JSON-RPC requestId `32`，method `item/commandExecution/requestApproval`，turn `01a08e77-326d-7cb1-a055-eaee3808223b`；`availableDecisions` 含 `accept`，本次只发送 `accept`。
+- Gateway 保留 numeric request ID 并正确回发；临时文件已生成，收到 `serverRequest/resolved`，pending store 清空。Attempt 5 原始记录未取得 terminal callback/Run completed 证据，不能在本 Attempt 追认 terminal。
+- **Verdict：approval accept/resolved/file 通过；terminal 未确认。** `acceptForSession` 仍按 runtime capability unavailable 处理，不阻塞基础 turn approval；terminal 闭环由 Attempt 6 单独确认。
+
+### B. External：通过
+
+- 独立 cwd `/tmp/better-subagent-c1-attempt5-external`；thread `01a08e77-fbdf-78d1-a966-1a242e95d218`；第二 client turn `01a08e77-fcc7-7780-9d7c-54d6655149c9`。
+- Gateway 无 managed run 时第二 client 启动可控 turn，第一 client/Gateway snapshot 为 `external/active`，activeTurnId 正确，无抢占。
+- 第二 client `turn/interrupt` 返回 `{}`；第一 client 收到真实 `turn/completed`，最终 snapshot 为 `external/idle`、`activeTurnId=null`。
+- **Verdict：external active→interrupt→completed→idle 全链路通过。**
+
+### Attempt 5 清理与总评
+
+两个 thread 均 `thread/delete` 返回 `{}`；临时文件、cwd、探针均已清理。Attempt 5 证明 numeric approval identity、accept/resolved/file 和 external 全链路有效，但该 Attempt 的 terminal 未确认；terminal 闭环由 Attempt 6 后续确认。session-scope approval 仍不应宣称全局可用。
+
+## Attempt 6（approval terminal only）
+
+- cwd `/tmp/better-subagent-c1-attempt6`；thread `01a08e79-5ae4-7621-8386-0f8ef150dc87`；Gateway Run `run-99de00999d354b9bb8da4fee2d496eff`；turn `01a08e79-5bbd-72a2-b472-e075101aefee`。
+- 严格短 prompt 触发 command approval，numeric requestId `33`，`availableDecisions=[accept, acceptWithExecpolicyAmendment, cancel]`；只提交 `accept`。文件生成，pending 清空；Gateway 收到 resolved（同一 approval handler 路径）。
+- 5 秒轮询 `thread/read(includeTurns=false)`：第 1 次起即 `status.type=idle`；Gateway store 的 Run 同时为 `completed`，无 `active`/`unknown` 关联错误。随后最多 50 秒轮询中一直保持 idle/completed。
+- 探针的 `terms=[]` 是旁路监听遗漏；Gateway Run 已为 `completed`，结合 `thread/read` 的 idle 状态，足以证明 terminal callback 已执行，不构成产品失败。执行封装在 60 秒附近终止，未完成原计划 90 秒轮询；之后只读复核仍返回 idle，并直接 `thread/delete` 成功。
+- 已清理 thread、`approval.txt`、cwd 与探针；未重测其他项。**Attempt 6 verdict：approval terminal callback 通过（由 Gateway Run=completed 证实）；没有发现 Gateway run active 的关联 bug。**
+
+## C1 MVP 最终裁决
+
+结合 Attempts 2、5、6，C1 MVP **通过**。已验证：durable thread/read-first、首 turn/completed、可控长 turn steer、interrupt/interrupted、command turn approval 的 numeric request ID 保真 + `accept`/`serverRequest/resolved`/文件结果/Run completed、第二 client external active→interrupt→真实 completed→external idle，以及 idle reconnect/read/resume。未验证或有能力条件：`acceptForSession` 仅当当前 request 的 `availableDecisions` 或 permissions scope 明确支持时展示；当前 command approval 不支持，不宣称全局可用。自动 reconnect 后恢复/自动调度、active/pending reconnect、分页 history 与完整 settings effective projection 延期。
