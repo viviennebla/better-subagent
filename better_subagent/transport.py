@@ -163,6 +163,7 @@ class AppServerTransport:
             self._send_json({"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     def read_thread(self, thread_id: str, *, include_turns: bool = True) -> dict[str, Any]:
+        self._ensure_connected()
         return self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
 
     def resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:

@@ -29,7 +29,26 @@ class FakeAppServerTransport(AppServerTransport):
         return {}
 
 
+class FreshReadTransport(FakeAppServerTransport):
+    def __init__(self):
+        super().__init__()
+        self.connect_calls = 0
+        self._connected.clear()
+
+    def connect(self, timeout=5.0):
+        self.connect_calls += 1
+        self._connected.set()
+        return {"connected": True}
+
+
 class AppServerTransportTest(unittest.TestCase):
+    def test_fresh_read_connects_before_request(self):
+        transport = FreshReadTransport()
+        result = transport.read_thread("thread-fresh", include_turns=False)
+        self.assertEqual(transport.connect_calls, 1)
+        self.assertEqual(result["thread"]["id"], "thread-fresh")
+        self.assertEqual(transport.calls[0], ("thread/read", {"threadId": "thread-fresh", "includeTurns": False}))
+
     def test_development_default_uses_workspace_profile(self):
         config = validate_session_config("session-1", {"sessionId": "session-1", "owner": "o", "role": "coder", "threadId": "thread-1", "cwd": "/tmp", "model": "m", "effort": "high", "approvalPolicy": "on-request", "sandboxPolicy": "workspace-write", "enabled": True, "unavailableReason": ""})
         self.assertEqual(config["requestedPolicy"]["permissionProfileId"], ":workspace")

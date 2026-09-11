@@ -40,6 +40,9 @@ class FakeTransport:
     def complete(self, turn_id: str) -> None:
         self.callbacks[turn_id]("completed", None)
 
+    def read_thread(self, thread_id: str, *, include_turns: bool = True):
+        return {"thread": {"id": thread_id, "status": {"type": "idle"}, "turns": [] if include_turns else None}}
+
 
 class BlockingInterruptTransport(FakeTransport):
     def __init__(self) -> None:
@@ -463,6 +466,9 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("requestedPolicy", detail["session"])
         self.assertEqual(detail["pendingApprovals"], [])
+        status, history = self.request(f"/v1/sessions/{SESSION_ID}/history")
+        self.assertEqual(status, 200)
+        self.assertEqual(history["sessionId"], SESSION_ID)
         status, error = self.request("/v1/sessions/missing")
         self.assertEqual(status, 404)
         self.assertEqual(error["error"], "session_not_found")
