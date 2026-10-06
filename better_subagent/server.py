@@ -12,7 +12,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .contracts import GatewayError
-from .gateway import GatewayService, JsonGatewayStore
+from .gateway import GatewayService
+from .storage import SqliteGatewayStore
 from .transport import AppServerTransport, CodexSdkWorkerTransport
 
 
@@ -143,7 +144,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1999)
-    parser.add_argument("--data", type=Path, default=root / "data" / "better-subagent.json")
+    parser.add_argument("--data", type=Path, default=root / "data" / "runtime.sqlite3")
+    parser.add_argument("--legacy-json", type=Path, default=None)
     parser.add_argument("--transport", choices=("sdk-worker", "app-server"), default="app-server")
     parser.add_argument("--app-server-socket", type=Path, default=Path.home() / ".codex/app-server-control/app-server-control.sock")
     args = parser.parse_args()
@@ -153,7 +155,15 @@ def main() -> None:
         if args.transport == "app-server"
         else CodexSdkWorkerTransport()
     )
-    gateway = GatewayService(JsonGatewayStore(args.data), transport)
+    data_path = args.data
+    legacy_json = args.legacy_json
+    if data_path.suffix.lower() == ".json":
+        legacy_json = legacy_json or data_path
+        data_path = data_path.with_name("runtime.sqlite3")
+    elif legacy_json is None:
+        candidate = data_path.with_name("better-subagent.json")
+        legacy_json = candidate if candidate.exists() else None
+    gateway = GatewayService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), transport)
     server = GatewayHttpServer((args.host, args.port), gateway)
     logging.info("better-subagent listening on http://%s:%s", args.host, args.port)
     try:
