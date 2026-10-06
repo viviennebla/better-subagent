@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -14,36 +15,6 @@ APPROVAL_POLICIES = {"on-request", "never", "untrusted"}
 SANDBOX_POLICIES = {"read-only", "workspace-write"}
 OPERATION_POLICY_PRESETS = {"development", "workspace", "full-access"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-REPORT_VERDICTS = {"approved", "ready_for_review", "changes_requested", "blocked", "rejected"}
-
-# The Board sends only sessionId, prompt and requestId. The structured final
-# output contract is therefore a Gateway-owned execution invariant, not a
-# caller-controlled SDK option.
-STAGE_REPORT_OUTPUT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": [
-        "taskId", "stage", "role", "sessionId", "summary", "outcome", "verdict",
-        "artifact", "findings", "implementation", "verification", "risks", "nextAction",
-    ],
-    "properties": {
-        "taskId": {"type": "string"},
-        "stage": {"type": "string"},
-        "role": {"type": "string"},
-        "sessionId": {"type": "string"},
-        "summary": {"type": "string"},
-        "outcome": {"type": "string", "enum": sorted(REPORT_VERDICTS)},
-        "verdict": {"type": "string", "enum": sorted(REPORT_VERDICTS)},
-        "artifact": {"type": "string"},
-        "findings": {"type": "array", "items": {"type": "string"}},
-        "implementation": {"type": "string"},
-        "verification": {"type": "array", "items": {"type": "string"}},
-        "risks": {"type": "array", "items": {"type": "string"}},
-        "nextAction": {"type": "string"},
-    },
-}
-
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -87,9 +58,18 @@ def text(value: Any, field: str, maximum: int, *, required: bool = True) -> str:
     return normalized
 
 
+def exact_text(value: Any, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value:
+        raise GatewayError("validation_error", f"{field} 不能为空且必须是字符串", status=422)
+    if len(value) > maximum:
+        raise GatewayError("validation_error", f"{field} 不能超过 {maximum} 个字符", status=422)
+    return value
+
+
 SESSION_CONFIG_FIELDS = {
     "sessionId",
     "owner",
+    "name",
     "role",
     "threadId",
     "cwd",
@@ -104,6 +84,8 @@ SESSION_CONFIG_FIELDS = {
     "controlMode",
 }
 
+ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,79}$")
+
 
 def validate_session_config(session_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -115,17 +97,26 @@ def validate_session_config(session_id: str, value: Any) -> dict[str, Any]:
     body_id = text(value.get("sessionId", ""), "session.sessionId", 160)
     if body_id != normalized_id:
         raise GatewayError("validation_error", "路径 sessionId 与配置不一致", status=422)
-    cwd = text(value.get("cwd", ""), "session.cwd", 500)
-    if not Path(cwd).is_absolute() or "\x00" in cwd:
+    owner = text(value.get("owner", ""), "session.owner", 120)
+    role = text(value.get("role", ""), "session.role", 80)
+    if not ROLE_PATTERN.fullmatch(role):
+        raise GatewayError("validation_error", "session.role 必须是小写 slug", status=422)
+    name = text(value.get("name", owner), "session.name", 160)
+    runtime_fields = {"threadId", "cwd", "model", "effort", "approvalPolicy", "sandboxPolicy"}
+    has_runtime = bool(runtime_fields & set(value))
+    if has_runtime and not runtime_fields <= set(value):
+        raise GatewayError("validation_error", "legacy Session 必须完整提供运行参数", status=422)
+    cwd = text(value.get("cwd", ""), "session.cwd", 500) if has_runtime else ""
+    if cwd and (not Path(cwd).is_absolute() or "\x00" in cwd):
         raise GatewayError("validation_error", "session.cwd 必须是绝对路径", status=422)
-    effort = text(value.get("effort", ""), "session.effort", 40)
-    if effort not in EFFORTS:
+    effort = text(value.get("effort", ""), "session.effort", 40) if has_runtime else ""
+    if effort and effort not in EFFORTS:
         raise GatewayError("validation_error", f"不支持的 effort: {effort}", status=422)
-    approval = text(value.get("approvalPolicy", ""), "session.approvalPolicy", 80)
-    if approval not in APPROVAL_POLICIES:
+    approval = text(value.get("approvalPolicy", ""), "session.approvalPolicy", 80) if has_runtime else ""
+    if approval and approval not in APPROVAL_POLICIES:
         raise GatewayError("validation_error", f"不支持的 approvalPolicy: {approval}", status=422)
-    sandbox = text(value.get("sandboxPolicy", ""), "session.sandboxPolicy", 80)
-    if sandbox not in SANDBOX_POLICIES:
+    sandbox = text(value.get("sandboxPolicy", ""), "session.sandboxPolicy", 80) if has_runtime else ""
+    if sandbox and sandbox not in SANDBOX_POLICIES:
         raise GatewayError("validation_error", f"不支持的 sandboxPolicy: {sandbox}", status=422)
     enabled = value.get("enabled", True)
     if not isinstance(enabled, bool):
@@ -147,7 +138,7 @@ def validate_session_config(session_id: str, value: Any) -> dict[str, Any]:
     preset = operation_policy.get("preset", "development")
     if preset not in OPERATION_POLICY_PRESETS:
         raise GatewayError("validation_error", f"不支持的 operationPolicy preset: {preset}", status=422)
-    roots = value.get("runtimeWorkspaceRoots", operation_policy.get("runtimeWorkspaceRoots", [cwd]))
+    roots = value.get("runtimeWorkspaceRoots", operation_policy.get("runtimeWorkspaceRoots", [cwd] if cwd else []))
     if not isinstance(roots, list) or not all(isinstance(root, str) and Path(root).is_absolute() for root in roots):
         raise GatewayError("validation_error", "runtimeWorkspaceRoots 必须是绝对路径数组", status=422)
     control_mode = value.get("controlMode", "managed")
@@ -157,14 +148,17 @@ def validate_session_config(session_id: str, value: Any) -> dict[str, Any]:
         raise GatewayError("validation_error", "不可用 Session 必须提供 unavailableReason", status=422)
     return {
         "sessionId": normalized_id,
-        "owner": text(value.get("owner", ""), "session.owner", 120),
-        "role": text(value.get("role", ""), "session.role", 80),
-        "threadId": text(value.get("threadId", ""), "session.threadId", 160),
-        "cwd": cwd,
-        "model": text(value.get("model", ""), "session.model", 120),
-        "effort": effort,
-        "approvalPolicy": approval,
-        "sandboxPolicy": sandbox,
+        "owner": owner,
+        "name": name,
+        "role": role,
+        **({
+            "threadId": text(value.get("threadId", ""), "session.threadId", 160),
+            "cwd": cwd,
+            "model": text(value.get("model", ""), "session.model", 120),
+            "effort": effort,
+            "approvalPolicy": approval,
+            "sandboxPolicy": sandbox,
+        } if has_runtime else {}),
         "enabled": enabled,
         "unavailableReason": unavailable_reason,
         "controlMode": control_mode,
@@ -195,7 +189,7 @@ def validate_start_run(value: Any) -> dict[str, str]:
     return {
         "requestId": text(value.get("requestId", ""), "requestId", 160),
         "sessionId": text(value.get("sessionId", ""), "sessionId", 160),
-        "prompt": text(value.get("prompt", ""), "prompt", 128_000),
+        "prompt": exact_text(value.get("prompt", ""), "prompt", 128_000),
     }
 
 
@@ -214,7 +208,7 @@ def validate_steer_run(value: Any) -> dict[str, str]:
     unknown = set(value) - {"requestId", "prompt"}
     if unknown:
         raise GatewayError("validation_error", f"SteerRun 不支持字段: {', '.join(sorted(unknown))}", status=422)
-    return {"requestId": text(value.get("requestId", ""), "requestId", 160), "prompt": text(value.get("prompt", ""), "prompt", 128_000)}
+    return {"requestId": text(value.get("requestId", ""), "requestId", 160), "prompt": exact_text(value.get("prompt", ""), "prompt", 128_000)}
 
 
 def validate_approval_decision(value: Any) -> dict[str, Any]:
@@ -248,6 +242,8 @@ def session_summary(session: dict[str, Any], runs: list[dict[str, Any]], *, pend
     )
     enabled = bool(session.get("enabled", True))
     runtime = session.get("runtimeStatus", "notLoaded")
+    if session.get("controlMode") == "external" and runtime in {"active", "waitingOnApproval"}:
+        busy = True
     if not enabled:
         public_status = "unavailable"
     elif session.get("controlMode") == "external" and runtime == "active":
@@ -263,6 +259,7 @@ def session_summary(session: dict[str, Any], runs: list[dict[str, Any]], *, pend
     return {
         "sessionId": session["sessionId"],
         "owner": session["owner"],
+        "name": session.get("name", session["owner"]),
         "role": session["role"],
         "status": public_status,
         "busy": busy,
@@ -281,7 +278,7 @@ def session_summary(session: dict[str, Any], runs: list[dict[str, Any]], *, pend
     }
 
 
-def run_status(run: dict[str, Any]) -> dict[str, Any]:
+def run_status(run: dict[str, Any], *, thread_id: str | None = None) -> dict[str, Any]:
     return {
         "gatewayRunId": run["gatewayRunId"],
         "requestId": run["requestId"],
@@ -292,4 +289,8 @@ def run_status(run: dict[str, Any]) -> dict[str, Any]:
         "startedAt": run.get("startedAt"),
         "terminalAt": run.get("terminalAt"),
         "error": run.get("error"),
+        # These are read-only runtime identities.  Never synthesize either
+        # value from gatewayRunId; absent transport evidence remains null.
+        "threadId": thread_id,
+        "transportTurnId": run.get("transportTurnId"),
     }
