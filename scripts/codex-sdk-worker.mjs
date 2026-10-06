@@ -33,10 +33,7 @@ try {
     approvalPolicy: request.approvalPolicy,
     additionalDirectories: request.additionalDirectories || []
   });
-  const streamed = await thread.runStreamed(request.prompt, {
-    outputSchema: request.outputSchema,
-    signal: controller.signal
-  });
+  const streamed = await thread.runStreamed(request.prompt, { signal: controller.signal });
   for await (const event of streamed.events) {
     emit(event);
     if (event.type === "thread.started") {
