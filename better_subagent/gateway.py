@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 from .contracts import (
     OCCUPYING_RUN_STATUSES,
@@ -56,57 +53,7 @@ def _normalize_app_server_timestamp(value: Any) -> str | None:
     return None
 
 
-class JsonGatewayStore:
-    """Small atomic JSON store; no queue or distributed locking."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.lock_path = path.with_suffix(path.suffix + ".lock")
-        self._thread_lock = threading.Lock()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            self._write_unlocked({"schemaVersion": 1, "sessions": {}, "runs": [], "pendingApprovals": {}})
-
-    @contextmanager
-    def locked(self) -> Iterator[dict[str, Any]]:
-        with self._thread_lock:
-            with self.lock_path.open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                try:
-                    value = self._read_unlocked()
-                    yield value
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-    def read(self) -> dict[str, Any]:
-        with self.locked() as value:
-            return json.loads(json.dumps(value))
-
-    def save(self, value: dict[str, Any]) -> None:
-        self._write_unlocked(value)
-
-    def _read_unlocked(self) -> dict[str, Any]:
-        with self.path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-        if not isinstance(value, dict) or value.get("schemaVersion") != 1:
-            raise RuntimeError("better-subagent 数据文件 schemaVersion 非 1")
-        if not isinstance(value.get("sessions"), dict) or not isinstance(value.get("runs"), list):
-            raise RuntimeError("better-subagent 数据文件结构无效")
-        return value
-
-    def _write_unlocked(self, value: dict[str, Any]) -> None:
-        descriptor, temporary = tempfile.mkstemp(prefix="better-subagent-", suffix=".json", dir=self.path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
+from .storage import JsonGatewayStore, SqliteGatewayStore
 
 _SUPPORTED_APPROVAL_DECISIONS = frozenset({"accept", "decline", "cancel", "acceptForSession"})
 
@@ -130,7 +77,7 @@ class GatewayService:
     OVERVIEW_ROUND_PAGE_SIZE = 200
     OVERVIEW_ROUND_WORKERS = 8
 
-    def __init__(self, store: JsonGatewayStore, transport: GatewayTransport) -> None:
+    def __init__(self, store: SqliteGatewayStore, transport: GatewayTransport) -> None:
         self.store = store
         self.transport = transport
         self._live_run_ids: set[str] = set()
@@ -278,6 +225,11 @@ class GatewayService:
             return None
         terminal = self._turn_terminal_fact(turn) if isinstance(turn, dict) else None
         result = None
+        # Project a newer external Turn before closing the stale managed Run.
+        # This keeps the Session projection monotonic: _set_terminal only clears
+        # runtime state when activeTurnId still belongs to the managed Run.
+        if isinstance(active_turn, dict) and active_turn.get("id") != turn_id:
+            self._project_external_turn(thread_id, active_turn)
         if terminal is not None:
             result = self._set_terminal(
                 gateway_run_id,
@@ -285,11 +237,6 @@ class GatewayService:
                 terminal[1],
                 execution_established=True,
             )
-        # A newer active Turn with a different identity is external even if an
-        # unresolved stale Run still occupies the Session. Never claim it as
-        # the managed Turn merely because the old Run exists.
-        if isinstance(active_turn, dict) and active_turn.get("id") != turn_id:
-            self._project_external_turn(thread_id, active_turn)
         return result
 
     def _schedule_run_reconcile(self, gateway_run_id: str) -> None:
@@ -312,6 +259,8 @@ class GatewayService:
             raise
 
     def _reconcile_orphaned_runs(self) -> None:
+        if not callable(getattr(self.transport, "list_thread_turns", None)):
+            return
         board = self.store.read()
         for run in board["runs"]:
             gateway_run_id = run.get("gatewayRunId")
@@ -1086,7 +1035,10 @@ class GatewayService:
     def get_run(self, gateway_run_id: str) -> dict[str, Any]:
         board = self.store.read()
         run = self._find_run(board, gateway_run_id)
-        if run.get("status") in OCCUPYING_RUN_STATUSES:
+        if (
+            run.get("status") in OCCUPYING_RUN_STATUSES
+            and callable(getattr(self.transport, "list_thread_turns", None))
+        ):
             self._schedule_run_reconcile(gateway_run_id)
         session = board["sessions"].get(run.get("sessionId"), {})
         thread_id = session.get("threadId") if isinstance(session, dict) else None
