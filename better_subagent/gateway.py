@@ -195,6 +195,8 @@ class GatewayService:
                     )
                     if managed:
                         continue
+                    if session.get("controlMode", "managed") != "external":
+                        session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                     session.update({
                         "controlMode": "external",
                         "requestedControlMode": "external",
@@ -535,6 +537,8 @@ class GatewayService:
                     )
                     if managed:
                         continue
+                    if session.get("controlMode", "managed") != "external":
+                        session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                     session.update({"controlMode": "external", "requestedControlMode": "external", "runtimeStatus": "active", "activeTurnId": turn_id, "updatedAt": now_iso()})
             self.store.save(board)
 
@@ -798,6 +802,7 @@ class GatewayService:
                 if session.get("runtimeStatus") != "idle":
                     raise GatewayError("session_not_idle", "只有 idle Session 可以交接", status=409, request_id=request["requestId"])
                 result = {"status": "completed", "requestId": request["requestId"]}
+                session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                 session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "handoffRequestId": request["requestId"], "handoffResult": result, "lastHandoffRequestId": request["requestId"], "lastHandoffResult": result, "updatedAt": now_iso()})
                 self.store.save(board)
                 return {"session": session_summary(session, board["runs"]), "handoff": {"status": "completed", "requestId": request["requestId"]}}
@@ -855,6 +860,7 @@ class GatewayService:
             if session.get("runtimeStatus") != "idle":
                 raise GatewayError("session_not_idle", "只有 idle external Session 可以 reclaim", status=409, request_id=request["requestId"])
             result = {"status": "completed", "requestId": request["requestId"]}
+            session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
             session.update({"controlMode": "managed", "requestedControlMode": "managed", "handoffStatus": None, "handoffRequestId": None, "handoffResult": None, "lastReclaimRequestId": request["requestId"], "lastReclaimResult": result, "updatedAt": now_iso()})
             self.store.save(board)
             return {"session": session_summary(session, board["runs"]), "reclaim": result}
@@ -872,7 +878,7 @@ class GatewayService:
                 raise GatewayError("session_busy", "运行中的 Session 配置不能修改", status=409)
             previous = board["sessions"].get(session_id)
             if isinstance(previous, dict):
-                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult")
+                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration")
                 if not minimal_runtime:
                     preserved += ("runtimeStatus", "activeTurnId", "effectivePolicy", "policySource", "policyUpdatedAt")
                 for key in preserved:
@@ -969,6 +975,9 @@ class GatewayService:
                 "sessionId": request["sessionId"],
                 "promptHash": prompt_hash,
                 "status": "starting",
+                "targetDeviceId": session.get("deviceId"),
+                "targetAgentId": session.get("agentId"),
+                "controlGeneration": session.get("controlGeneration", 1),
                 "createdAt": timestamp,
                 "updatedAt": timestamp,
             }
@@ -1241,6 +1250,8 @@ class GatewayService:
                 if isinstance(session, dict) and session.get("activeTurnId") == run.get("transportTurnId"):
                     if run.get("handoffRequestId") and status == "interrupted":
                         result = {"status": "completed", "requestId": run.get("handoffRequestId")}
+                        if session.get("controlMode", "managed") != "external":
+                            session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                         session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "runtimeStatus": "idle", "activeTurnId": None, "handoffResult": result, "lastHandoffRequestId": run.get("handoffRequestId"), "lastHandoffResult": result, "updatedAt": timestamp})
                     elif run.get("handoffRequestId"):
                         result = {"status": "failed", "requestId": run.get("handoffRequestId")}

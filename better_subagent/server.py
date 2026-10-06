@@ -12,9 +12,10 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .contracts import GatewayError
+from .coordinator import CoordinatorService
+from .device_agent import LocalDeviceAgent
 from .gateway import GatewayService
 from .storage import SqliteGatewayStore
-from .transport import AppServerTransport, CodexSdkWorkerTransport
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -28,6 +29,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._json(HTTPStatus.OK, {"ok": True, "service": "better-subagent"})
+            return
+        if path == "/v1/devices":
+            self._handle(lambda _payload: self.gateway.list_devices(), HTTPStatus.OK, body=False)
+            return
+        if path == "/v1/agents":
+            self._handle(lambda _payload: self.gateway.list_agents(), HTTPStatus.OK, body=False)
             return
         if path == "/v1/sessions":
             self._handle(lambda _payload: self.gateway.list_sessions(), HTTPStatus.OK, body=False)
@@ -148,12 +155,24 @@ def main() -> None:
     parser.add_argument("--legacy-json", type=Path, default=None)
     parser.add_argument("--transport", choices=("sdk-worker", "app-server"), default="app-server")
     parser.add_argument("--app-server-socket", type=Path, default=Path.home() / ".codex/app-server-control/app-server-control.sock")
+    parser.add_argument("--device-id", default=None)
+    parser.add_argument("--agent-id", default=None)
+    parser.add_argument("--environment", default="local")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    transport = (
-        AppServerTransport(args.app_server_socket)
+    device_agent = (
+        LocalDeviceAgent.from_app_server(
+            args.app_server_socket,
+            device_id=args.device_id,
+            agent_id=args.agent_id,
+            environment=args.environment,
+        )
         if args.transport == "app-server"
-        else CodexSdkWorkerTransport()
+        else LocalDeviceAgent.from_sdk_worker(
+            device_id=args.device_id,
+            agent_id=args.agent_id,
+            environment=args.environment,
+        )
     )
     data_path = args.data
     legacy_json = args.legacy_json
@@ -163,7 +182,7 @@ def main() -> None:
     elif legacy_json is None:
         candidate = data_path.with_name("better-subagent.json")
         legacy_json = candidate if candidate.exists() else None
-    gateway = GatewayService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), transport)
+    gateway = CoordinatorService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), device_agent)
     server = GatewayHttpServer((args.host, args.port), gateway)
     logging.info("better-subagent listening on http://%s:%s", args.host, args.port)
     try:

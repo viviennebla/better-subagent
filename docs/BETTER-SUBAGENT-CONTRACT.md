@@ -4,9 +4,28 @@
 
 ## 边界
 
-better-subagent 是 Codex Session Gateway。它独占 Session runtime 配置、Session 单活、Gateway Run、SDK worker 与 interrupt；Board 只传 `sessionId`、完整 Prompt 和稳定 `requestId`。Browser 与 Agent 不直接访问 Gateway。
+better-subagent 是 Codex Session Gateway / Coordinator。它独占 Session runtime 配置、Session 单活、Gateway Run、Device / Agent runtime ownership 与 interrupt；Board 只传 `sessionId`、完整 Prompt 和稳定 `requestId`。Browser 不直接访问 Device Agent。
 
 当前默认使用长期 App Server transport；`sdk-worker` 通过配置保留为回退。Runtime state 使用本地 SQLite（WAL）持久化；首次切换时可从旧 `better-subagent.json` 一次性导入 Session / Run / pending approval / request idempotency 状态。当前不包含登录/RBAC、HA 或跨 Coordinator 恢复。
+
+## Device / Agent projection
+
+Phase 2 增加本机 runtime 模型：
+
+```text
+Device → Agent → Session → Run
+```
+
+Coordinator 不再直接创建具体 App Server transport；`LocalDeviceAgent` 持有本机 transport，并向 Coordinator 提供原有 runtime capability。Phase 2 有意保持这个 boundary 在同一进程内，不新增临时 IPC；Phase 3 的 durable remote protocol 将替换该 local boundary。
+
+新增只读接口：
+
+```text
+GET /v1/devices
+GET /v1/agents
+```
+
+Session additive metadata：`deviceId / agentId / environment / controlGeneration`。Run 创建时冻结 `targetDeviceId / targetAgentId / controlGeneration`。handoff / reclaim 或 managed ↔ external ownership 真正切换时递增 generation。现有 Board 调用不需要提交这些字段。
 
 ## SessionSummary
 

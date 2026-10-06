@@ -62,6 +62,36 @@ class SqliteGatewayStoreTest(unittest.TestCase):
             recovered = SqliteGatewayStore(database, legacy_json_path=legacy)
             self.assertEqual(recovered.read()["runs"], [])
 
+    def test_phase1_database_schema_upgrades_for_device_agent_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    INSERT INTO metadata(key, value) VALUES('schema_version', '1');
+                    CREATE TABLE sessions (session_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
+                    CREATE TABLE runs (gateway_run_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, status TEXT NOT NULL, prompt_hash TEXT, payload_json TEXT NOT NULL);
+                    CREATE TABLE pending_approvals (request_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
+                    """
+                )
+
+            store = SqliteGatewayStore(database)
+            store.upsert_device({
+                "deviceId": "dev-1", "environment": "dev", "status": "online"
+            })
+            store.upsert_agent({
+                "agentId": "runtime@dev-1", "deviceId": "dev-1", "role": "runtime", "enabled": True
+            })
+
+            with sqlite3.connect(database) as connection:
+                version = connection.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0]
+            self.assertEqual(version, "2")
+            self.assertEqual(store.list_devices()[0]["deviceId"], "dev-1")
+            self.assertEqual(store.list_agents()[0]["agentId"], "runtime@dev-1")
+
     def test_request_id_uniqueness_is_enforced_by_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteGatewayStore(Path(directory) / "runtime.sqlite3")

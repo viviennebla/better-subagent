@@ -644,7 +644,9 @@ V1 不额外开多个公开端口。
 
 ### Phase 2 — local Device Agent
 
-在同一台机器上启动：
+实现说明：Phase 2 先建立 Coordinator → LocalDeviceAgent → AppServerTransport 的明确代码 ownership boundary 和 Device / Agent durable model。LocalDeviceAgent 与 Coordinator 暂时同进程，不为了本机拆进程提前增加一套临时 IPC；Phase 3 引入 durable remote command/event protocol 时再把该 boundary 进程化。
+
+逻辑拓扑仍为：
 
 ```text
 Coordinator
