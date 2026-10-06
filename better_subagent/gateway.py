@@ -941,10 +941,19 @@ class GatewayService:
                 for key in preserved:
                     if key in previous:
                         record[key] = previous[key]
+                if record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
+                    record.update({"controlMode": "external", "requestedControlMode": "external"})
+                ownership_changed = (
+                    record.get("threadId") != previous.get("threadId")
+                    or record.get("controlMode", "managed")
+                    != previous.get("controlMode", "managed")
+                )
+                if ownership_changed:
+                    record["controlGeneration"] = int(previous.get("controlGeneration", 1)) + 1
                 comparable = lambda item: {key: value for key, value in item.items() if key not in {"updatedAt", "runtimeStatus", "activeTurnId", "effectivePolicy", "policyUpdatedAt"}}
                 if comparable(previous) == comparable(record) and (not minimal_runtime or previous.get("runtimeStatus") == record.get("runtimeStatus")):
                     return {"session": session_summary(previous, board["runs"]), "idempotent": True}
-            if record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
+            elif record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
                 record.update({"controlMode": "external", "requestedControlMode": "external"})
             board["sessions"][session_id] = record
             self.store.save(board)

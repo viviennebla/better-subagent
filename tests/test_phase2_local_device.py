@@ -12,12 +12,14 @@ from better_subagent.storage import SqliteGatewayStore
 class FakeTransport:
     def __init__(self) -> None:
         self.starts = []
+        self.runtime_thread_id = None
+        self.runtime_status = "idle"
 
     def read_thread(self, thread_id: str, *, include_turns: bool = True):
         return {
             "thread": {
-                "id": thread_id,
-                "status": {"type": "idle"},
+                "id": self.runtime_thread_id or thread_id,
+                "status": {"type": self.runtime_status},
                 "cwd": "/tmp/worktree",
                 "model": "gpt-5.6-sol",
                 "effort": "medium",
@@ -77,6 +79,44 @@ class Phase2LocalDeviceTest(unittest.TestCase):
 
             self.assertEqual(gateway.list_devices()["devices"][0]["deviceId"], "dev-local-01")
             self.assertEqual(gateway.list_agents()["agents"][0]["agentId"], "runtime@dev-local-01")
+
+    def test_control_generation_changes_when_thread_or_runtime_owner_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transport = FakeTransport()
+            agent = LocalDeviceAgent(
+                transport,
+                device_id="dev-local-01",
+                agent_id="runtime@dev-local-01",
+                environment="dev",
+            )
+            gateway = GatewayService(
+                SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), agent
+            )
+            gateway.put_session("session-1", {
+                "sessionId": "session-1",
+                "owner": "coder",
+                "role": "coder",
+                "threadId": "thread-1",
+                "cwd": "/tmp/worktree",
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "approvalPolicy": "on-request",
+                "sandboxPolicy": "workspace-write",
+            })
+
+            transport.runtime_thread_id = "thread-2"
+            rebound = gateway.put_session("session-1", {
+                "sessionId": "session-1", "owner": "coder", "role": "coder"
+            })["session"]
+            self.assertEqual(rebound["controlGeneration"], 2)
+            self.assertEqual(gateway.store.read()["sessions"]["session-1"]["threadId"], "thread-2")
+
+            transport.runtime_status = "active"
+            external = gateway.put_session("session-1", {
+                "sessionId": "session-1", "owner": "coder", "role": "coder"
+            })["session"]
+            self.assertEqual(external["controlMode"], "external")
+            self.assertEqual(external["controlGeneration"], 3)
 
     def test_control_generation_changes_on_idle_handoff_and_reclaim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
