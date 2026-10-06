@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from better_subagent.contracts import GatewayError, validate_start_run
-from better_subagent.gateway import GatewayService, JsonGatewayStore
+from better_subagent.gateway import GatewayService
+from better_subagent.storage import SqliteGatewayStore
 from better_subagent.transport import TransportRejected
 
 
@@ -59,7 +60,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_minimal_registration_reads_thread_runtime_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = RuntimeTransport()
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             payload = {"sessionId": SESSION_ID, "owner": "validator", "name": "Validation", "role": "validator"}
             first = gateway.put_session(SESSION_ID, payload)
             second = gateway.put_session(SESSION_ID, payload)
@@ -85,7 +86,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
                 return result
 
             transport.read_thread = read_subagent
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "reviewer", "role": "reviewer"})
             summary = gateway.list_sessions()["sessions"][0]
             self.assertEqual(summary["status"], "unavailable")
@@ -97,7 +98,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_active_registration_is_external_and_busy_and_start_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = RuntimeTransport(status="active")
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             summary = gateway.list_sessions()["sessions"][0]
             self.assertEqual(summary["controlMode"], "external")
@@ -110,14 +111,14 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_minimal_registration_accepts_app_server_reasoning_effort(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = RuntimeTransport(reasoning_effort_only=True)
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             self.assertEqual(gateway.store.read()["sessions"][SESSION_ID]["effort"], "medium")
 
     def test_start_rechecks_real_thread_status_before_creating_run(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = RuntimeTransport()
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             transport.status = "active"
             with self.assertRaisesRegex(GatewayError, "runtime 状态"):
@@ -127,7 +128,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_external_active_terminal_idle_reclaim_and_dispatch_converge(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = RuntimeTransport(status="active")
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             gateway._on_transport_notification({"method": "turn/completed", "params": {"threadId": "thread-real", "turn": {"id": "unknown-external-turn"}}})
             self.assertEqual(gateway.list_sessions()["sessions"][0]["runtimeStatus"], "idle")
@@ -140,7 +141,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_notification_before_thread_read_response_does_not_invert_store_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             transport = NotificationBeforeResponseTransport()
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             transport.gateway = gateway
             transport.notify = True
@@ -154,7 +155,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
                 {"data": [{"id": "other-thread", "sessionId": "other"}], "nextCursor": "page-2"},
                 {"cursor": "page-2", "data": [{"id": "thread-real", "sessionId": SESSION_ID}], "nextCursor": None},
             ])
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), transport)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), transport)
             gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             self.assertEqual(gateway.store.read()["sessions"][SESSION_ID]["threadId"], "thread-real")
             self.assertEqual(transport.read_calls[0], {"threadId": SESSION_ID, "includeTurns": False})
@@ -163,14 +164,14 @@ class SelfServiceRegistrationTest(unittest.TestCase):
     def test_thread_list_not_found_and_page_limit_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             not_found = RuntimeTransport(pages=[{"data": [], "nextCursor": None}])
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "not-found.json"), not_found)
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "not-found.json"), not_found)
             with self.assertRaisesRegex(GatewayError, "未找到"):
                 gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             pages = [{"data": [], "nextCursor": f"page-{index + 1}"} for index in range(gateway.THREAD_LOOKUP_MAX_PAGES)]
             for index in range(1, len(pages)):
                 pages[index]["cursor"] = f"page-{index}"
             limited = RuntimeTransport(pages=pages)
-            limited_gateway = GatewayService(JsonGatewayStore(Path(directory) / "limited.json"), limited)
+            limited_gateway = GatewayService(SqliteGatewayStore(Path(directory) / "limited.json"), limited)
             with self.assertRaisesRegex(GatewayError, "有界查找"):
                 limited_gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
 
@@ -178,7 +179,7 @@ class SelfServiceRegistrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=False):
             for key in ("BETTER_SUBAGENT_DEFAULT_MODEL", "BETTER_SUBAGENT_DEFAULT_EFFORT", "CODEX_MODEL", "CODEX_EFFORT"):
                 os.environ.pop(key, None)
-            gateway = GatewayService(JsonGatewayStore(Path(directory) / "gateway.json"), RuntimeTransport(include_runtime=False))
+            gateway = GatewayService(SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), RuntimeTransport(include_runtime=False))
             with self.assertRaises(GatewayError) as raised:
                 gateway.put_session(SESSION_ID, {"sessionId": SESSION_ID, "owner": "validator", "role": "validator"})
             self.assertEqual(raised.exception.code, "runtime_defaults_unavailable")
