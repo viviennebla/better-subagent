@@ -25,6 +25,15 @@ Session detail exposes only the control/runtime summary and a bounded approval p
 
 完整合同见 [`docs/BETTER-SUBAGENT-CONTRACT.md`](docs/BETTER-SUBAGENT-CONTRACT.md)。
 
+## 下一阶段：Multi-device Runtime
+
+better-subagent 的下一阶段不是把机器管理塞回 Board，而是从单机 Session Gateway 演进为多设备 Agent Runtime：
+
+- [Multi-device Better Subagent PRD](docs/MULTI-DEVICE-RUNTIME-PRD.md)
+- [Multi-device Better Subagent 技术方案](docs/MULTI-DEVICE-RUNTIME-TECHNICAL-DESIGN.md)
+
+首个业务验收场景是：开发机 Agent 完成开发并部署测试环境后，Board 将 Verification Task 调度给 `verifier@test`，better-subagent 把 Run 路由到测试设备上的 Device Agent / Codex App Server，并可靠回传终态。实现从 SQLite single-device parity 开始，不直接跳到远程协议。
+
 ## 本地运行
 
 ```bash
