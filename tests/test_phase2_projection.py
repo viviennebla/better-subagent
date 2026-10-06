@@ -2,7 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from better_subagent.gateway import GatewayService, JsonGatewayStore
+from better_subagent.gateway import GatewayService
+from better_subagent.storage import SqliteGatewayStore
 
 
 class Transport:
@@ -13,7 +14,7 @@ class Transport:
 class Phase2ProjectionTest(unittest.TestCase):
     def test_run_read_exposes_actual_transport_turn_and_thread(self):
         with tempfile.TemporaryDirectory() as directory:
-            store = JsonGatewayStore(Path(directory) / "gateway.json")
+            store = SqliteGatewayStore(Path(directory) / "runtime.sqlite3")
             gateway = GatewayService(store, Transport())
             gateway.put_session("session-1", {
                 "sessionId": "session-1", "owner": "coder", "role": "coder", "threadId": "thread-1",
@@ -31,7 +32,7 @@ class Phase2ProjectionTest(unittest.TestCase):
 
     def test_unknown_transport_turn_is_null_not_gateway_alias(self):
         with tempfile.TemporaryDirectory() as directory:
-            store = JsonGatewayStore(Path(directory) / "gateway.json")
+            store = SqliteGatewayStore(Path(directory) / "runtime.sqlite3")
             gateway = GatewayService(store, Transport())
             with store.locked() as board:
                 board["sessions"]["session-1"] = {"sessionId": "session-1", "threadId": "thread-1"}
