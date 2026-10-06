@@ -14,11 +14,9 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Protocol
-
-from .contracts import STAGE_REPORT_OUTPUT_SCHEMA
-
 
 TerminalCallback = Callable[[str, str | None], None]
 
@@ -31,6 +29,36 @@ class GatewayTransport(Protocol):
 
 NotificationCallback = Callable[[dict[str, Any]], None]
 ApprovalCallback = Callable[[str, dict[str, Any]], None]
+
+
+_LEGACY_PERMISSION_PROFILE_ALIASES = {
+    # Ledger stores this combined policy label, while Codex 0.154 expects a
+    # named permission profile separate from approvalPolicy.  :workspace is
+    # the equivalent built-in profile; on-request remains a request field.
+    "workspace-write-on-request": ":workspace",
+    "workspace-write-ledger-network": ":workspace",
+}
+
+
+# App Server defaults thread/list to interactive sources only (cli/vscode).
+# Gateway registration and overview must also see persisted exec/app-server and
+# subagent threads, otherwise a valid Codex session is reported as missing.
+_PERSISTED_THREAD_SOURCE_KINDS = [
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+]
+
+
+def _app_server_permission_profile(profile_id: Any) -> Any:
+    return _LEGACY_PERMISSION_PROFILE_ALIASES.get(profile_id, profile_id)
 
 
 class AppServerTransport:
@@ -53,6 +81,8 @@ class AppServerTransport:
         self._connected = threading.Event()
         self._stopping = False
         self._turns: dict[str, tuple[TerminalCallback, str]] = {}
+        self._reconcile_inflight: set[tuple[str, str]] = set()
+        self._terminal_tombstones: deque[tuple[int, str, str]] = deque(maxlen=256)
         self._notifications: list[NotificationCallback] = []
         self._approval: ApprovalCallback | None = None
         self._pending_approvals: dict[str, dict[str, Any] | str] = {}
@@ -153,7 +183,9 @@ class AppServerTransport:
             raise TransportOutcomeUnknown(f"App Server 请求超时: {method}")
         if "error" in slot:
             error = slot["error"]
-            raise TransportRejected(str(error.get("message", error)) if isinstance(error, dict) else str(error))
+            if isinstance(error, dict):
+                raise TransportRejected(error.get("message", str(error)), code=error.get("code"), data=error.get("data"))
+            raise TransportRejected(str(error))
         return slot.get("result") or {}
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
@@ -166,11 +198,19 @@ class AppServerTransport:
         self._ensure_connected()
         return self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
 
-    def list_threads(self, *, limit: int = 100) -> dict[str, Any]:
+    def list_threads(self, *, cursor: str | None = None, limit: int = 100) -> dict[str, Any]:
         self._ensure_connected()
+        params: dict[str, Any] = {
+            "limit": limit,
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "sourceKinds": list(_PERSISTED_THREAD_SOURCE_KINDS),
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
         return self.request(
             "thread/list",
-            {"limit": limit, "sortKey": "updated_at", "sortDirection": "desc"},
+            params,
         )
 
     def list_thread_turns(
@@ -179,13 +219,17 @@ class AppServerTransport:
         *,
         cursor: str | None = None,
         limit: int = 3,
+        items_view: str = "summary",
+        sort_direction: str = "desc",
     ) -> dict[str, Any]:
         self._ensure_connected()
+        if sort_direction not in {"asc", "desc"}:
+            raise ValueError("sort_direction must be asc or desc")
         params: dict[str, Any] = {
             "threadId": thread_id,
             "limit": limit,
-            "sortDirection": "desc",
-            "itemsView": "summary",
+            "sortDirection": sort_direction,
+            "itemsView": items_view,
         }
         if cursor is not None:
             params["cursor"] = cursor
@@ -200,7 +244,9 @@ class AppServerTransport:
         request.pop("gatewayRunId", None)
         policy = request.pop("requestedPolicy", None)
         if policy and isinstance(policy, dict):
-            request["permissions"] = policy.get("permissionProfileId", ":workspace")
+            request["permissions"] = _app_server_permission_profile(
+                policy.get("permissionProfileId", ":workspace")
+            )
             request["approvalPolicy"] = policy.get("approvalPolicy", request.get("approvalPolicy", "on-request"))
             request["approvalsReviewer"] = policy.get("approvalsReviewer", "auto_review")
             request["runtimeWorkspaceRoots"] = policy.get("runtimeWorkspaceRoots", request.get("runtimeWorkspaceRoots", []))
@@ -216,38 +262,27 @@ class AppServerTransport:
             resume.pop("sandboxPolicy", None)
             try:
                 read_result = self.read_thread(thread_id, include_turns=False)
-                need_resume = False
             except TransportRejected as exc:
-                message = str(exc).lower()
-                missing = message.startswith(("no rollout found for thread id", "thread not loaded", "thread notloaded"))
-                if not missing:
+                if not _is_exact_no_rollout(exc, thread_id):
                     raise
-                need_resume = True
                 read_result = None
-            if need_resume:
-                resume_result = self.resume_thread(resume)
-                effective_policy = resume_result.get("activePermissionProfile")
-                thread = resume_result.get("thread") or {}
-                resume_status = thread.get("status") or resume_result.get("status") or {}
-                status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
-                if status_type != "idle":
-                    raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
-                read_result = self.read_thread(thread_id, include_turns=False)
-            read_thread = read_result.get("thread") or read_result
-            read_status = read_thread.get("status") or {}
-            read_type = read_status.get("type") if isinstance(read_status, dict) else read_status
-            if read_type == "notLoaded" and not need_resume:
-                resume_result = self.resume_thread(resume)
-                effective_policy = resume_result.get("activePermissionProfile")
-                thread = resume_result.get("thread") or {}
-                resume_status = thread.get("status") or resume_result.get("status") or {}
-                status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
-                if status_type != "idle":
-                    raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
-                read_result = self.read_thread(thread_id, include_turns=False)
+            if read_result is not None:
                 read_thread = read_result.get("thread") or read_result
+                _assert_thread_identity(read_thread, thread_id)
                 read_status = read_thread.get("status") or {}
                 read_type = read_status.get("type") if isinstance(read_status, dict) else read_status
+                if read_type not in {"idle", "notLoaded"}:
+                    raise TransportRejected(f"Session read 状态不可启动 turn: {read_type or 'unknown'}")
+
+            # thread/read is replay-only on shared app-server daemons: it does
+            # not attach this connection to the thread listener. Always rejoin
+            # through thread/resume before turn/start so approvals and terminal
+            # server requests are routed back to this Gateway connection.
+            read_result, effective_policy = self._resume_for_start(resume, thread_id)
+            read_thread = read_result.get("thread") or read_result
+            _assert_thread_identity(read_thread, thread_id)
+            read_status = read_thread.get("status") or {}
+            read_type = read_status.get("type") if isinstance(read_status, dict) else read_status
             if read_type != "idle":
                 raise TransportRejected(f"Session read 状态不可启动 turn: {read_type or 'unknown'}")
             if effective_policy is None:
@@ -256,21 +291,50 @@ class AppServerTransport:
         # legacy Gateway field and must never be sent alongside permissions.
         sandbox = request.pop("sandboxPolicy", None)
         if "permissionProfileId" in request:
-            request["permissions"] = request.pop("permissionProfileId")
+            request["permissions"] = _app_server_permission_profile(
+                request.pop("permissionProfileId")
+            )
         if sandbox is not None and "permissions" not in request:
             request["sandboxPolicy"] = sandbox
         result = self.request("turn/start", request)
         turn = result.get("turn") if isinstance(result.get("turn"), dict) else result
-        turn_id = str((turn or {}).get("id") or result.get("turnId") or f"rpc-turn-{self._next_id}")
+        turn_id = (turn or {}).get("id") or result.get("turnId")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise TransportOutcomeUnknown("App Server turn/start 未返回真实 turn id")
+        orphan = None
         with self._lock:
             self._turns[turn_id] = (on_terminal, str(params.get("threadId", "")))
             orphan = self._orphan_terminals.pop((self._generation, str(params.get("threadId", "")), turn_id), None)
         if orphan is not None:
-            on_terminal(orphan[0], orphan[1])
+            self._finish_turn(turn_id, orphan[0], orphan[1])
         result_value = {"transportTurnId": turn_id, "processId": self._generation}
         if effective_policy is not None:
             result_value["effectivePolicy"] = effective_policy
         return result_value
+
+    def _resume_for_start(self, resume: dict[str, Any], thread_id: str) -> tuple[dict[str, Any], Any]:
+        try:
+            resume_result = self.resume_thread(resume)
+        except TransportRejected as exc:
+            if not _is_exact_no_rollout(exc, thread_id):
+                raise
+            # A read-only connection may still see an unmaterialized thread,
+            # but without a successful thread/resume this connection is not
+            # attached to the thread listener. Starting anyway would lose
+            # approval/server requests on shared app-server daemons.
+            raise TransportRejected(
+                "Session 尚未形成可 resume 的持久化 history，当前 Gateway 无法建立 listener；拒绝直接启动 turn",
+                code=exc.code,
+                data=exc.data,
+            ) from exc
+        effective_policy = resume_result.get("activePermissionProfile")
+        thread = resume_result.get("thread") or {}
+        _assert_thread_identity(thread, thread_id)
+        resume_status = thread.get("status") or resume_result.get("status") or {}
+        status_type = resume_status.get("type") if isinstance(resume_status, dict) else resume_status
+        if status_type != "idle":
+            raise TransportRejected(f"Session 当前不可启动 turn: {status_type or 'unknown'}")
+        return self.read_thread(thread_id, include_turns=False), effective_policy
 
     def steer_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.request("turn/steer", {"threadId": params["threadId"], "expectedTurnId": params["expectedTurnId"], "input": [{"type": "text", "text": params["prompt"]}]})
@@ -426,6 +490,7 @@ class AppServerTransport:
             self._connected.clear()
             pending, self._pending = self._pending, {}
             turns, self._turns = self._turns, {}
+            self._terminal_tombstones.clear()
             self._orphan_terminals.clear()
             self._frame_buffer.clear()
             self._message_buffer.clear()
@@ -443,24 +508,90 @@ class AppServerTransport:
             except Exception:
                 pass
 
+    def _finish_turn(self, turn_id: str, status: str, error: str | None = None) -> bool:
+        with self._lock:
+            entry = self._turns.pop(turn_id, None)
+            if entry:
+                self._terminal_tombstones.append((self._generation, entry[1], turn_id))
+        if not entry:
+            return False
+        entry[0](status, error)
+        return True
+
+    def _schedule_reconcile(self, thread_id: str, turn_id: str) -> None:
+        key_value = (thread_id, turn_id)
+        with self._lock:
+            generation = self._generation
+            if key_value in self._reconcile_inflight or not any(
+                managed_thread == thread_id and managed_turn == turn_id
+                for managed_turn, (_callback, managed_thread) in self._turns.items()
+            ):
+                return
+            self._reconcile_inflight.add(key_value)
+
+        def worker() -> None:
+            try:
+                with self._lock:
+                    if not self.connected or generation != self._generation or not any(
+                        managed_thread == thread_id and managed_turn == turn_id
+                        for managed_turn, (_callback, managed_thread) in self._turns.items()
+                    ):
+                        return
+                status = "unknown"; error = "App Server status changed without an exact terminal Turn fact"
+                try:
+                    result = self.list_thread_turns(thread_id, limit=100, items_view="notLoaded")
+                    with self._lock:
+                        if not self.connected or generation != self._generation or not any(
+                            managed_thread == thread_id and managed_turn == turn_id
+                            for managed_turn, (_callback, managed_thread) in self._turns.items()
+                        ):
+                            return
+                    turns = result.get("data") if isinstance(result, dict) else None
+                    match = next((item for item in turns if isinstance(item, dict) and item.get("id") == turn_id), None) if isinstance(turns, list) else None
+                    if match is None:
+                        error = "App Server turn/list omitted the exact managed Turn"
+                    else:
+                        status = {"completed": "completed", "interrupted": "interrupted", "failed": "failed"}.get(str(match.get("status")), "unknown")
+                        value = match.get("error")
+                        error = value.get("message") if isinstance(value, dict) else value
+                        if status == "unknown": error = error or f"Unsupported terminal Turn status: {match.get('status')}"
+                except Exception as exc:
+                    error = f"App Server terminal Turn reconcile failed: {exc}"
+                self._finish_turn(turn_id, status, error)
+            finally:
+                with self._lock:
+                    self._reconcile_inflight.discard(key_value)
+
+        threading.Thread(target=worker, name=f"better-subagent-reconcile-{turn_id}", daemon=True).start()
+
     def _handle_notification(self, message: dict[str, Any], generation: int | None = None) -> None:
+        if generation is not None and generation != self._generation:
+            return
         method = message.get("method", "")
         params = message.get("params") or {}
         if method == "turn/completed":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id", ""))
+            status = {"completed": "completed", "interrupted": "interrupted", "failed": "failed"}.get(str(turn.get("status")), "unknown")
+            error = turn.get("error")
             with self._lock:
-                entry = self._turns.pop(turn_id, None)
-            if entry:
-                status = {"completed": "completed", "interrupted": "interrupted", "failed": "failed"}.get(str(turn.get("status")), "unknown")
-                error = turn.get("error")
-                entry[0](status, error.get("message") if isinstance(error, dict) else error)
-            else:
-                status = {"completed": "completed", "interrupted": "interrupted", "failed": "failed"}.get(str(turn.get("status")), "unknown")
-                error = turn.get("error")
+                seen = (generation or self._generation, str(params.get("threadId", "")), turn_id) in self._terminal_tombstones
+            if not seen and not self._finish_turn(turn_id, status, error.get("message") if isinstance(error, dict) else error):
                 with self._lock:
                     thread_id = str(params.get("threadId", ""))
-                    self._orphan_terminals[(generation or self._generation, thread_id, turn_id)] = (status, error.get("message") if isinstance(error, dict) else error)
+                    orphan_key = (generation or self._generation, thread_id, turn_id)
+                    if orphan_key not in self._terminal_tombstones:
+                        self._orphan_terminals[orphan_key] = (status, error.get("message") if isinstance(error, dict) else error)
+        if method in {"thread/status/changed", "thread/status", "thread/closed"}:
+            thread = params.get("thread") if isinstance(params.get("thread"), dict) else params
+            thread_id = thread.get("id") or thread.get("threadId")
+            status = thread.get("status") or thread.get("type")
+            status_type = status.get("type") if isinstance(status, dict) else status
+            if isinstance(thread_id, str) and (method == "thread/closed" or status_type in {"idle", "notLoaded"}):
+                with self._lock:
+                    turn_ids = [turn_id for turn_id, (_callback, managed_thread) in self._turns.items() if managed_thread == thread_id]
+                for turn_id in turn_ids:
+                    self._schedule_reconcile(thread_id, turn_id)
         if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"}:
             request_id = message.get("id")
             self._pending_approvals[str(request_id)] = {"method": method, "params": params, "threadId": params.get("threadId")}
@@ -483,9 +614,30 @@ class AppServerTransport:
 class TransportRejected(Exception):
     """The SDK definitely rejected a run before authoritative start."""
 
+    def __init__(self, message: str, *, code: Any = None, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
 
 class TransportOutcomeUnknown(Exception):
     """The SDK may have started a run, but the authoritative result was not observed."""
+
+
+def _is_exact_no_rollout(error: TransportRejected, thread_id: str) -> bool:
+    """Narrow classifier for the known App Server durable-thread condition."""
+    if error.code != -32600:
+        return False
+    message = str(error).strip().lower()
+    anchored = message.startswith("no rollout found for thread id ")
+    return anchored and message == f"no rollout found for thread id {thread_id.lower()}"
+
+
+def _assert_thread_identity(thread: Any, requested: str) -> None:
+    if not isinstance(thread, dict) or not isinstance(thread.get("id"), str) or not thread.get("id"):
+        raise TransportOutcomeUnknown("App Server thread/read 缺少 thread identity")
+    if thread["id"] != requested:
+        raise TransportRejected("App Server 返回了不一致的 thread id")
 
 
 class CodexSdkWorkerTransport:
@@ -524,7 +676,6 @@ class CodexSdkWorkerTransport:
             "approvalPolicy": params["approvalPolicy"],
             "sandbox": sandbox,
             "additionalDirectories": [params["cwd"]] if sandbox == "workspace-write" else [],
-            "outputSchema": STAGE_REPORT_OUTPUT_SCHEMA,
         }
 
     def start_turn(self, params: dict[str, Any], on_terminal: TerminalCallback) -> dict[str, Any]:
