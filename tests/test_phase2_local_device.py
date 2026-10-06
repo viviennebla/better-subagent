@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from better_subagent.coordinator import CoordinatorService
+from better_subagent.gateway import GatewayService
 from better_subagent.device_agent import LocalDeviceAgent
 from better_subagent.storage import SqliteGatewayStore
 
@@ -35,7 +35,7 @@ class FakeTransport:
 
 
 class Phase2LocalDeviceTest(unittest.TestCase):
-    def test_coordinator_registers_local_device_agent_and_freezes_run_target(self) -> None:
+    def test_gateway_registers_local_device_agent_and_freezes_run_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             transport = FakeTransport()
             agent = LocalDeviceAgent(
@@ -44,11 +44,11 @@ class Phase2LocalDeviceTest(unittest.TestCase):
                 agent_id="runtime@dev-local-01",
                 environment="dev",
             )
-            coordinator = CoordinatorService(
+            gateway = GatewayService(
                 SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), agent
             )
 
-            coordinator.put_session("session-1", {
+            gateway.put_session("session-1", {
                 "sessionId": "session-1",
                 "owner": "coder",
                 "role": "coder",
@@ -59,13 +59,13 @@ class Phase2LocalDeviceTest(unittest.TestCase):
                 "approvalPolicy": "on-request",
                 "sandboxPolicy": "workspace-write",
             })
-            session = coordinator.get_session("session-1")["session"]
+            session = gateway.get_session("session-1")["session"]
             self.assertEqual(session["deviceId"], "dev-local-01")
             self.assertEqual(session["agentId"], "runtime@dev-local-01")
             self.assertEqual(session["environment"], "dev")
             self.assertEqual(session["controlGeneration"], 1)
 
-            started = coordinator.start_run({
+            started = gateway.start_run({
                 "requestId": "run-once",
                 "sessionId": "session-1",
                 "prompt": "do it",
@@ -75,8 +75,8 @@ class Phase2LocalDeviceTest(unittest.TestCase):
             self.assertEqual(started["controlGeneration"], 1)
             self.assertEqual(len(transport.starts), 1)
 
-            self.assertEqual(coordinator.list_devices()["devices"][0]["deviceId"], "dev-local-01")
-            self.assertEqual(coordinator.list_agents()["agents"][0]["agentId"], "runtime@dev-local-01")
+            self.assertEqual(gateway.list_devices()["devices"][0]["deviceId"], "dev-local-01")
+            self.assertEqual(gateway.list_agents()["agents"][0]["agentId"], "runtime@dev-local-01")
 
     def test_control_generation_changes_on_idle_handoff_and_reclaim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -86,10 +86,10 @@ class Phase2LocalDeviceTest(unittest.TestCase):
                 agent_id="runtime@dev-local-01",
                 environment="dev",
             )
-            coordinator = CoordinatorService(
+            gateway = GatewayService(
                 SqliteGatewayStore(Path(directory) / "runtime.sqlite3"), agent
             )
-            coordinator.put_session("session-1", {
+            gateway.put_session("session-1", {
                 "sessionId": "session-1",
                 "owner": "coder",
                 "role": "coder",
@@ -100,13 +100,13 @@ class Phase2LocalDeviceTest(unittest.TestCase):
                 "approvalPolicy": "on-request",
                 "sandboxPolicy": "workspace-write",
             })
-            with coordinator.store.locked() as board:
+            with gateway.store.locked() as board:
                 board["sessions"]["session-1"]["runtimeStatus"] = "idle"
-                coordinator.store.save(board)
+                gateway.store.save(board)
 
-            handed = coordinator.handoff("session-1", {"requestId": "handoff-1"})
+            handed = gateway.handoff("session-1", {"requestId": "handoff-1"})
             self.assertEqual(handed["session"]["controlGeneration"], 2)
-            reclaimed = coordinator.reclaim("session-1", {"requestId": "reclaim-1"})
+            reclaimed = gateway.reclaim("session-1", {"requestId": "reclaim-1"})
             self.assertEqual(reclaimed["session"]["controlGeneration"], 3)
 
 

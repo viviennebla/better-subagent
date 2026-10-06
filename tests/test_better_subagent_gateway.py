@@ -1027,7 +1027,7 @@ class GatewayServiceTest(unittest.TestCase):
             "active",
         )
 
-    def test_duplicate_start_after_coordinator_restart_returns_same_run(self) -> None:
+    def test_duplicate_start_after_gateway_restart_returns_same_run(self) -> None:
         payload = {"requestId": "restart-duplicate", "sessionId": SESSION_ID, "prompt": "do once"}
         first = self.gateway.start_run(payload)
         self.assertEqual(len(self.transport.starts), 1)

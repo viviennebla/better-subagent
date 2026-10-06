@@ -48,7 +48,7 @@ better-subagent 只负责 runtime 调度与执行，不负责决定 Task 应进�
    - `test-server-01` 是实际执行设备。
 4. Run 创建后必须固定 target Device，后续 steer / approval / interrupt 都回到同一设备。
 5. 跨设备执行采用 durable command + idempotent execution，不依赖一次 HTTP 请求是否刚好成功返回。
-6. Device Agent 主动连接 Coordinator，避免要求每台设备暴露入站端口。
+6. Device Agent 主动连接 Gateway，避免要求每台设备暴露入站端口。
 7. MCP 可作为外部控制入口，但不替代内部 durable runtime protocol。
 8. V1 先跑通真实 dev → test verification vertical slice，不建设通用集群调度平台。
 
@@ -117,7 +117,7 @@ Run 的 targetDeviceId 一旦创建不得被 Task / Session 后续修改覆盖�
 
 ### P0-1 Device Registry
 
-Coordinator 必须能够：
+Gateway 必须能够：
 
 - 注册 Device；
 - 更新 heartbeat；
@@ -130,7 +130,7 @@ Coordinator 必须能够：
 每台执行机器运行一个轻量 Device Agent：
 
 - 维护稳定 deviceId；
-- 主动连接 Coordinator；
+- 主动连接 Gateway；
 - 连接本机 Codex App Server；
 - 上报本机 Agent / Session inventory；
 - 接收 start / steer / interrupt / approval command；
@@ -154,7 +154,7 @@ Board 仍然可以按 Session 调度；better-subagent 负责把 Session 路由�
 
 start run 不再依赖一次同步远程调用完成。
 
-Coordinator 需要 durable command queue，至少覆盖：
+Gateway 需要 durable command queue，至少覆盖：
 
 - start;
 - steer;
@@ -182,7 +182,7 @@ Device Agent 必须可靠回传：
 - transport unknown；
 - control mode changed。
 
-Coordinator 重启或 Device 短暂断线后不能永久丢失 terminal event。
+Gateway 重启或 Device 短暂断线后不能永久丢失 terminal event。
 
 ### P0-6 Existing Board Compatibility
 
@@ -206,7 +206,7 @@ Board 不应因为多设备改造被迫同时大重写。
 
 ### P0-7 Environment-aware Discovery
 
-Coordinator 能按 environment / role / capability 查询 Agent / Session。
+Gateway 能按 environment / role / capability 查询 Agent / Session。
 
 V1 不要求自动负载均衡。Board / Workflow Controller 可以明确选择 verifier@test 对应的 Session。
 
@@ -232,7 +232,7 @@ better-subagent 不负责：
 
 ## 6. MCP 范围
 
-MCP 是对外能力入口，不是 Coordinator ↔ Device Agent 内部协议。
+MCP 是对外能力入口，不是 Gateway ↔ Device Agent 内部协议。
 
 V1 可预留：
 
@@ -258,7 +258,7 @@ V1 明确不做：
 - Session live migration；
 - 自动复制 worktree；
 - 自动搬迁 Codex thread；
-- 多 Coordinator HA；
+- 多 Gateway HA；
 - Kafka / RabbitMQ / NATS；
 - Browser 直接访问 Device Agent；
 - 任意远程 shell MCP；
@@ -269,16 +269,16 @@ V1 明确不做：
 
 以下场景必须有确定行为：
 
-1. Coordinator 写入 command 后立即重启；
+1. Gateway 写入 command 后立即重启；
 2. Device 收到 command 后 ACK 丢失；
-3. Turn 已启动但 Coordinator 没收到响应；
+3. Turn 已启动但 Gateway 没收到响应；
 4. Device 执行过程中离线；
 5. Device 重连；
 6. terminal event 在断线期间产生；
 7. 同一 commandId 重复发送；
 8. Session 在 command 排队期间 handoff / reclaim；
 9. Session rebind 后旧 command 到达；
-10. Coordinator 与 Device 对 Run 状态不一致。
+10. Gateway 与 Device 对 Run 状态不一致。
 
 禁止通过“自动再次发送 Prompt”解决 unknown outcome。
 
@@ -288,9 +288,9 @@ V1 假设部署在可信私有网络 / overlay network 中。
 
 最低要求：
 
-- Device Agent 主动向 Coordinator 建立连接；
+- Device Agent 主动向 Gateway 建立连接；
 - Device identity 不能由业务 Prompt 决定；
-- Browser 不能提交任意 Coordinator / Device endpoint；
+- Browser 不能提交任意 Gateway / Device endpoint；
 - Device 注册凭据与 Codex thread/session identity 分离；
 - 不把 App Server socket 暴露到网络；
 - 远程协议只暴露明确 runtime command，不提供通用 shell proxy。
@@ -309,14 +309,14 @@ Device B: environment=test, role=verifier
 流程：
 
 1. 两台 Device Agent 同时 online；
-2. Coordinator 能列出两台 Device 和各自 Session；
+2. Gateway 能列出两台 Device 和各自 Session；
 3. Board 对 dev Session 的已有调度行为不回归；
 4. 创建 Verification Task；
 5. dispatch 到 verifier@test Session；
 6. Run 固定 targetDeviceId=Device B；
 7. Device B 的 Codex App Server 启动对应 Turn；
 8. Turn 完成；
-9. Coordinator Run 收敛 terminal；
+9. Gateway Run 收敛 terminal；
 10. Agent 能按现有 Ledger 方式回报；
 11. Device B 临时断线后重复上述流程仍可恢复。
 
@@ -327,7 +327,7 @@ V1 完成条件：
 - 单设备现有 better-subagent contract 全部回归通过；
 - 两设备同时 online；
 - 跨设备 start / steer / interrupt / approval 可路由；
-- Coordinator / Device Agent 任一侧重启不造成重复 Turn；
+- Gateway / Device Agent 任一侧重启不造成重复 Turn；
 - offline Device 不被调度；
 - terminal event 不因短时断线永久丢失；
 - existing Board adapter 无需大改即可工作；

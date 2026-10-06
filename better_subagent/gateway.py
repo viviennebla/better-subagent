@@ -80,6 +80,7 @@ class GatewayService:
     def __init__(self, store: SqliteGatewayStore, transport: GatewayTransport) -> None:
         self.store = store
         self.transport = transport
+        self._ensure_local_device_projection()
         self._live_run_ids: set[str] = set()
         self._run_reconcile_inflight: set[str] = set()
         self._run_reconcile_after: dict[str, float] = {}
@@ -96,6 +97,58 @@ class GatewayService:
         # a Gateway restart. Reconcile them from exact App Server Turn facts;
         # failures remain fail-closed and must not prevent Gateway startup.
         self._reconcile_orphaned_runs()
+
+    def _local_device_identity(self) -> dict[str, Any] | None:
+        device_id = getattr(self.transport, "device_id", None)
+        agent_id = getattr(self.transport, "agent_id", None)
+        environment = getattr(self.transport, "environment", None)
+        if not all(isinstance(item, str) and item for item in (device_id, agent_id, environment)):
+            return None
+        return {
+            "deviceId": device_id,
+            "agentId": agent_id,
+            "environment": environment,
+            "controlGeneration": 1,
+        }
+
+    def _ensure_local_device_projection(self) -> None:
+        identity = self._local_device_identity()
+        if identity is None:
+            return
+        device_record = getattr(self.transport, "device_record", None)
+        agent_record = getattr(self.transport, "agent_record", None)
+        if callable(device_record):
+            self.store.upsert_device(device_record())
+        if callable(agent_record):
+            self.store.upsert_agent(agent_record())
+        with self.store.locked() as board:
+            changed = False
+            for session in board["sessions"].values():
+                for key, value in identity.items():
+                    if key not in session:
+                        session[key] = value
+                        changed = True
+            for run in board["runs"]:
+                session = board["sessions"].get(run.get("sessionId"), {})
+                if not isinstance(session, dict):
+                    continue
+                defaults = {
+                    "targetDeviceId": session.get("deviceId", identity["deviceId"]),
+                    "targetAgentId": session.get("agentId", identity["agentId"]),
+                    "controlGeneration": session.get("controlGeneration", 1),
+                }
+                for key, value in defaults.items():
+                    if key not in run:
+                        run[key] = value
+                        changed = True
+            if changed:
+                self.store.save(board)
+
+    def list_devices(self) -> dict[str, Any]:
+        return {"devices": self.store.list_devices()}
+
+    def list_agents(self) -> dict[str, Any]:
+        return {"agents": self.store.list_agents()}
 
     def _remember_live_run(self, gateway_run_id: str) -> None:
         with self._live_run_lock:
@@ -870,6 +923,10 @@ class GatewayService:
         minimal_runtime = "threadId" not in record
         if minimal_runtime:
             record.update(self._resolve_minimal_runtime(session_id))
+        identity = self._local_device_identity()
+        if identity is not None:
+            for key, value in identity.items():
+                record.setdefault(key, value)
         with self.store.locked() as board:
             if any(
                 run.get("sessionId") == session_id and run.get("status") in OCCUPYING_RUN_STATUSES

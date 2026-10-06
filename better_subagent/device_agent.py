@@ -1,7 +1,7 @@
 """Local Device Agent runtime boundary.
 
-Phase 2 keeps Coordinator and Device Agent in one process while making runtime
-ownership explicit.  The Coordinator only sees this adapter; the adapter owns
+Phase 2 keeps Gateway and Device Agent in one process while making runtime
+ownership explicit.  The Gateway only sees this adapter; the adapter owns
 the concrete App Server transport.  Phase 3 can replace this local boundary
 with the durable remote protocol without changing the public Gateway contract.
 """

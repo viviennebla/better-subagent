@@ -1,4 +1,4 @@
-"""SQLite persistence for the single-device Coordinator runtime."""
+"""SQLite persistence for the single-device Gateway runtime."""
 
 from __future__ import annotations
 

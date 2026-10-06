@@ -12,7 +12,6 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .contracts import GatewayError
-from .coordinator import CoordinatorService
 from .device_agent import LocalDeviceAgent
 from .gateway import GatewayService
 from .storage import SqliteGatewayStore
@@ -182,7 +181,7 @@ def main() -> None:
     elif legacy_json is None:
         candidate = data_path.with_name("better-subagent.json")
         legacy_json = candidate if candidate.exists() else None
-    gateway = CoordinatorService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), device_agent)
+    gateway = GatewayService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), device_agent)
     server = GatewayHttpServer((args.host, args.port), gateway)
     logging.info("better-subagent listening on http://%s:%s", args.host, args.port)
     try:
