@@ -99,4 +99,3 @@ class LocalDeviceAgent:
 
     def interrupt_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._transport.interrupt_turn(params)
-
