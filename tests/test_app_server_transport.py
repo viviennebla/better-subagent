@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 
-from better_subagent.transport import AppServerTransport, TransportRejected
+from better_subagent.transport import AppServerTransport, TransportOutcomeUnknown, TransportRejected
 from better_subagent.contracts import validate_session_config
 
 
@@ -54,9 +54,27 @@ class AppServerTransportTest(unittest.TestCase):
         transport.list_threads(limit=100)
         transport.list_thread_turns("thread-1", limit=3)
         transport.list_thread_turns("thread-1", cursor="next-page", limit=3)
+        transport.list_thread_turns("thread-1", limit=200, items_view="notLoaded")
+        transport.list_thread_turns("thread-1", limit=100, items_view="full", sort_direction="asc")
         self.assertEqual(transport.calls[0], (
             "thread/list",
-            {"limit": 100, "sortKey": "updated_at", "sortDirection": "desc"},
+            {
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "sourceKinds": [
+                    "cli",
+                    "vscode",
+                    "exec",
+                    "appServer",
+                    "subAgent",
+                    "subAgentReview",
+                    "subAgentCompact",
+                    "subAgentThreadSpawn",
+                    "subAgentOther",
+                    "unknown",
+                ],
+            },
         ))
         self.assertEqual(transport.calls[1], (
             "thread/turns/list",
@@ -68,6 +86,14 @@ class AppServerTransportTest(unittest.TestCase):
                 "threadId": "thread-1", "limit": 3, "sortDirection": "desc",
                 "itemsView": "summary", "cursor": "next-page",
             },
+        ))
+        self.assertEqual(transport.calls[3], (
+            "thread/turns/list",
+            {"threadId": "thread-1", "limit": 200, "sortDirection": "desc", "itemsView": "notLoaded"},
+        ))
+        self.assertEqual(transport.calls[4], (
+            "thread/turns/list",
+            {"threadId": "thread-1", "limit": 100, "sortDirection": "asc", "itemsView": "full"},
         ))
 
     def test_development_default_uses_workspace_profile(self):
@@ -85,14 +111,32 @@ class AppServerTransportTest(unittest.TestCase):
         self.assertEqual(captured["params"]["clientInfo"]["name"], "better-subagent")
         self.assertTrue(captured["params"]["capabilities"]["experimentalApi"])
 
-    def test_start_resume_and_turn_payloads(self):
+    def test_custom_permission_profile_is_passed_through(self):
         transport = FakeAppServerTransport()
         transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello", "cwd": "/tmp", "model": "m", "effort": "high", "approvalPolicy": "on-request", "sandboxPolicy": "workspace-write", "requestedPolicy": {"permissionProfileId": "vimo-development"}}, lambda *_: None)
-        self.assertEqual([call[0] for call in transport.calls], ["thread/read", "turn/start"])
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            ["thread/read", "thread/resume", "thread/read", "turn/start"],
+        )
+        resume = transport.calls[1][1]
         turn = transport.calls[-1][1]
+        self.assertEqual(resume["threadId"], "thread-1")
+        self.assertEqual(resume["permissions"], "vimo-development")
         self.assertEqual(turn["threadId"], "thread-1")
         self.assertEqual(turn["input"], [{"type": "text", "text": "hello"}])
+        self.assertEqual(turn["permissions"], "vimo-development")
         self.assertNotIn("sandboxPolicy", turn)
+
+    def test_idle_read_rejoins_listener_before_turn_start(self):
+        transport = FakeAppServerTransport()
+        transport.start_turn(
+            {"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"},
+            lambda *_: None,
+        )
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            ["thread/read", "thread/resume", "thread/read", "turn/start"],
+        )
 
     def test_second_start_rechecks_read_on_same_connection(self):
         transport = FakeAppServerTransport()
@@ -100,7 +144,13 @@ class AppServerTransportTest(unittest.TestCase):
         params = {"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}
         transport.start_turn(params, callback)
         transport.start_turn({**params, "gatewayRunId": "run-2"}, callback)
-        self.assertEqual([call[0] for call in transport.calls], ["thread/read", "turn/start", "thread/read", "turn/start"])
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            [
+                "thread/read", "thread/resume", "thread/read", "turn/start",
+                "thread/read", "thread/resume", "thread/read", "turn/start",
+            ],
+        )
 
     def test_steer_and_interrupt_schema_payloads(self):
         transport = FakeAppServerTransport()
@@ -122,10 +172,79 @@ class AppServerTransportTest(unittest.TestCase):
         transport._handle_notification({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
         transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda status, error: outcomes.append((status, error)))
         self.assertEqual(outcomes, [("completed", None)])
+        self.assertNotIn("turn-1", transport._turns)
+        self.assertEqual(transport._orphan_terminals, {})
+        self.assertIn((transport._generation, "thread-1", "turn-1"), transport._terminal_tombstones)
+        for _ in range(3):
+            transport._handle_notification({"method": "thread/status/changed", "params": {"threadId": "thread-1", "status": {"type": "idle"}}})
+            transport._handle_notification({"method": "thread/closed", "params": {"threadId": "thread-1"}})
+            transport._handle_notification({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
+        self.assertEqual(outcomes, [("completed", None)])
+        self.assertEqual(transport._orphan_terminals, {})
+
+    def test_thread_idle_notification_reconciles_without_blocking_reader_and_single_flight(self):
+        transport = FakeAppServerTransport(); outcomes = []; entered = threading.Event(); release = threading.Event(); probes = []
+        def list_turns(thread_id, **kwargs):
+            probes.append((thread_id, kwargs)); entered.set(); release.wait(1)
+            return {"data": [{"id": "turn-1", "status": "completed", "durationMs": 12}]}
+        transport.list_thread_turns = list_turns
+        transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *value: outcomes.append(value))
+        notification = {"method": "thread/status/changed", "params": {"threadId": "thread-1", "status": {"type": "idle"}}}
+        transport._handle_notification(notification); transport._handle_notification(notification); transport._handle_notification({"method": "thread/closed", "params": {"threadId": "thread-1"}})
+        self.assertTrue(entered.wait(1)); self.assertEqual(len(probes), 1); self.assertEqual(outcomes, [])
+        release.set()
+        deadline = time.time() + 1
+        while not outcomes and time.time() < deadline: time.sleep(0.01)
+        self.assertEqual(outcomes, [("completed", None)])
+
+    def test_reconcile_exact_terminal_statuses_and_unknown_facts(self):
+        for status, expected in (("completed", "completed"), ("interrupted", "interrupted"), ("failed", "failed"), ("queued", "unknown")):
+            with self.subTest(status=status):
+                transport = FakeAppServerTransport(); outcomes = []
+                transport.list_thread_turns = lambda thread_id, status=status, **kwargs: {"data": [{"id": "turn-1", "status": status}]}
+                transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *value: outcomes.append(value))
+                transport._handle_notification({"method": "thread/status/changed", "params": {"threadId": "thread-1", "status": {"type": "idle"}}})
+                deadline = time.time() + 1
+                while not outcomes and time.time() < deadline: time.sleep(0.01)
+                self.assertEqual(outcomes[0][0], expected)
+
+    def test_reconcile_missing_or_rpc_error_is_unknown(self):
+        for mode in ("missing", "error", "wrong-id"):
+            with self.subTest(mode=mode):
+                transport = FakeAppServerTransport(); outcomes = []
+                def probe(thread_id, mode=mode, **kwargs):
+                    if mode == "error": raise RuntimeError("probe failed")
+                    if mode == "missing": return {"data": []}
+                    return {"data": [{"id": "other-turn", "status": "completed"}]}
+                transport.list_thread_turns = probe
+                transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *value: outcomes.append(value))
+                transport._handle_notification({"method": "thread/closed", "params": {"threadId": "thread-1"}})
+                deadline = time.time() + 1
+                while not outcomes and time.time() < deadline: time.sleep(0.01)
+                self.assertEqual(outcomes[0][0], "unknown")
+
+    def test_reconcile_unknown_then_late_completed_has_no_orphan_or_second_callback(self):
+        transport = FakeAppServerTransport(); outcomes = []
+        transport.list_thread_turns = lambda *args, **kwargs: {"data": []}
+        transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *value: outcomes.append(value))
+        transport._handle_notification({"method": "thread/status/changed", "params": {"threadId": "thread-1", "status": {"type": "idle"}}})
+        deadline = time.time() + 1
+        while not outcomes and time.time() < deadline: time.sleep(0.01)
+        transport._handle_notification({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}})
+        self.assertEqual(outcomes, [("unknown", "App Server turn/list omitted the exact managed Turn")]); self.assertEqual(transport._orphan_terminals, {})
+
+    def test_close_during_probe_drops_worker_without_old_generation_callback(self):
+        transport = FakeAppServerTransport(); outcomes = []; entered = threading.Event(); release = threading.Event()
+        def probe(*args, **kwargs): entered.set(); release.wait(1); return {"data": [{"id": "turn-1", "status": "completed"}]}
+        transport.list_thread_turns = probe
+        transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *value: outcomes.append(value))
+        transport._handle_notification({"method": "thread/closed", "params": {"threadId": "thread-1"}}); self.assertTrue(entered.wait(1))
+        transport._mark_disconnected("test close", transport._generation); release.set(); time.sleep(0.05)
+        self.assertEqual(outcomes, [("unknown", "App Server transport disconnected: test close")])
 
     def test_resume_active_status_rejects_start(self):
         transport = FakeAppServerTransport()
-        transport.request = lambda method, params=None, **kwargs: {"thread": {"id": "thread-1", "status": {"type": "active"}}} if method == "thread/resume" else {}
+        transport.request = lambda method, params=None, **kwargs: {"thread": {"id": "thread-1", "status": {"type": "active"}}} if method in {"thread/read", "thread/resume"} else {}
         with self.assertRaises(TransportRejected):
             transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
 
@@ -151,7 +270,7 @@ class AppServerTransportTest(unittest.TestCase):
         def request(method, params=None, **kwargs):
             calls.append(method)
             if method == "thread/read" and calls.count("thread/read") == 1:
-                raise TransportRejected("no rollout found for thread id thread-1")
+                raise TransportRejected("no rollout found for thread id thread-1", code=-32600, data={"threadId": "thread-1"})
             if method == "thread/resume":
                 return {"thread": {"id": "thread-1", "status": {"type": "idle"}}, "activePermissionProfile": {"id": ":workspace"}}
             if method == "thread/read":
@@ -160,6 +279,123 @@ class AppServerTransportTest(unittest.TestCase):
         transport.request = request
         transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
         self.assertEqual(calls, ["thread/read", "thread/resume", "thread/read", "turn/start"])
+
+    def test_read_and_resume_no_rollout_never_blindly_starts_turn(self):
+        transport = FakeAppServerTransport(); calls = []
+        def request(method, params=None, **kwargs):
+            calls.append(method)
+            if method in {"thread/read", "thread/resume"}:
+                raise TransportRejected("no rollout found for thread id thread-1", code=-32600, data={"threadId": "thread-1"})
+            return {"turn": {"id": "turn-1"}}
+        transport.request = request
+        with self.assertRaisesRegex(TransportRejected, "无法建立 listener"):
+            transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
+        self.assertEqual(calls, ["thread/read", "thread/resume"])
+
+    def test_not_loaded_and_resume_no_rollout_never_blindly_starts_turn(self):
+        transport = FakeAppServerTransport(); calls = []
+        def request(method, params=None, **kwargs):
+            calls.append(method)
+            if method == "thread/read" and calls.count("thread/read") == 1:
+                return {"thread": {"id": "thread-1", "status": {"type": "notLoaded"}}}
+            if method == "thread/resume":
+                raise TransportRejected("no rollout found for thread id thread-1", code=-32600, data={"threadId": "thread-1"})
+            return {"turn": {"id": "turn-1"}}
+        transport.request = request
+        with self.assertRaisesRegex(TransportRejected, "无法建立 listener"):
+            transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
+        self.assertEqual(calls, ["thread/read", "thread/resume"])
+
+    def test_not_loaded_resume_nonexact_error_does_not_start(self):
+        for error in (TransportRejected("no rollout found for thread id thread-1", code=-32000), TransportRejected("no rollout found for thread id other", code=-32600), TransportRejected("thread not loaded", code=-32600)):
+            with self.subTest(error=str(error)):
+                transport = FakeAppServerTransport(); calls = []
+                def request(method, params=None, error=error, **kwargs):
+                    calls.append(method)
+                    if method == "thread/read": return {"thread": {"id": "thread-1", "status": {"type": "notLoaded"}}}
+                    if method == "thread/resume": raise error
+                    return {"turn": {"id": "turn-1"}}
+                transport.request = request
+                with self.assertRaises(TransportRejected):
+                    transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
+                self.assertEqual(calls, ["thread/read", "thread/resume"])
+
+    def test_nonexact_no_rollout_wrong_thread_or_code_does_not_start(self):
+        for error in (TransportRejected("no rollout found for thread id other", code=-32600), TransportRejected("no rollout found for thread id thread-1", code=-32000), TransportRejected("thread not loaded", code=-32600)):
+            with self.subTest(error=str(error)):
+                transport = FakeAppServerTransport()
+                def request(method, params=None, error=error, **kwargs):
+                    transport.calls.append((method, params))
+                    if method == "thread/read": raise error
+                    return {"turn": {"id": "turn-1"}}
+                transport.request = request
+                with self.assertRaises(TransportRejected):
+                    transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
+                self.assertEqual([call[0] for call in transport.calls], ["thread/read"])
+
+    def test_turn_start_missing_id_is_unknown_without_retry(self):
+        transport = FakeAppServerTransport(); starts = []
+        def request(method, params=None, **kwargs):
+            if method == "turn/start": starts.append(method); return {"turn": {}}
+            return {"thread": {"id": "thread-1", "status": {"type": "idle"}}}
+        transport.request = request
+        with self.assertRaises(TransportOutcomeUnknown):
+            transport.start_turn({"gatewayRunId": "run", "threadId": "thread-1", "prompt": "hello"}, lambda *_: None)
+        self.assertEqual(starts, ["turn/start"])
+
+    def test_legacy_permission_aliases_use_codex_workspace_profile(self):
+        for profile_id in (
+            "workspace-write-on-request",
+            "workspace-write-ledger-network",
+        ):
+            with self.subTest(profile_id=profile_id):
+                transport = FakeAppServerTransport()
+                calls = []
+
+                def request(method, params=None, **kwargs):
+                    calls.append((method, params))
+                    read_count = sum(call[0] == "thread/read" for call in calls)
+                    if method == "thread/read" and read_count == 1:
+                        return {"thread": {"id": "thread-1", "status": {"type": "notLoaded"}}}
+                    if method == "thread/resume":
+                        return {
+                            "thread": {"id": "thread-1", "status": {"type": "idle"}},
+                            "activePermissionProfile": {"id": ":workspace"},
+                        }
+                    if method == "thread/read":
+                        return {"thread": {"id": "thread-1", "status": {"type": "idle"}}}
+                    return {"turn": {"id": "turn-1"}}
+
+                transport.request = request
+                result = transport.start_turn(
+                    {
+                        "gatewayRunId": "run",
+                        "threadId": "thread-1",
+                        "prompt": "hello",
+                        "cwd": "/tmp",
+                        "model": "m",
+                        "effort": "high",
+                        "approvalPolicy": "on-request",
+                        "sandboxPolicy": "workspace-write",
+                        "requestedPolicy": {
+                            "permissionProfileId": profile_id,
+                            "approvalPolicy": "on-request",
+                            "approvalsReviewer": "auto_review",
+                            "runtimeWorkspaceRoots": ["/tmp"],
+                        },
+                    },
+                    lambda *_: None,
+                )
+
+                resume = next(params for method, params in calls if method == "thread/resume")
+                turn = next(params for method, params in calls if method == "turn/start")
+                self.assertEqual(resume["permissions"], ":workspace")
+                self.assertEqual(turn["permissions"], ":workspace")
+                self.assertEqual(resume["approvalPolicy"], "on-request")
+                self.assertEqual(turn["approvalPolicy"], "on-request")
+                self.assertNotIn("sandbox", resume)
+                self.assertNotIn("sandboxPolicy", turn)
+                self.assertEqual(result["effectivePolicy"], {"id": ":workspace"})
 
     def test_unknown_read_error_does_not_blindly_resume(self):
         transport = FakeAppServerTransport()
