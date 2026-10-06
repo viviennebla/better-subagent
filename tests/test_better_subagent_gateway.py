@@ -11,7 +11,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from better_subagent.contracts import GatewayError
-from better_subagent.gateway import GatewayService, JsonGatewayStore
+from better_subagent.gateway import GatewayService
+from better_subagent.storage import SqliteGatewayStore
 from better_subagent.server import GatewayHttpServer
 from better_subagent.transport import (
     CodexSdkWorkerTransport,
@@ -198,7 +199,7 @@ class GatewayServiceTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.transport = FakeTransport()
         self.gateway = GatewayService(
-            JsonGatewayStore(Path(self.temporary.name) / "gateway.json"), self.transport
+            SqliteGatewayStore(Path(self.temporary.name) / "runtime.sqlite3"), self.transport
         )
         self.gateway.put_session(SESSION_ID, session_config())
 
@@ -598,7 +599,7 @@ class GatewayServiceTest(unittest.TestCase):
             gateway.handoff(SESSION_ID, {"requestId": "handoff-2"})
 
         unknown_transport = UnknownInterruptTransport()
-        unknown_store = JsonGatewayStore(Path(self.temporary.name) / "unknown.json")
+        unknown_store = SqliteGatewayStore(Path(self.temporary.name) / "unknown.sqlite3")
         unknown_gateway = GatewayService(unknown_store, unknown_transport)
         unknown_gateway.put_session(SESSION_ID, session_config())
         unknown_gateway.start_run({"requestId": "unknown-start", "sessionId": SESSION_ID, "prompt": "未知"})
@@ -910,7 +911,12 @@ class GatewayServiceTest(unittest.TestCase):
         calls_after_startup = len(self.transport.turn_list_calls)
         self.assertEqual(restarted.get_run("run-orphaned")["run"]["status"], "active")
         self.assertEqual(len(self.transport.turn_list_calls), calls_after_startup)
-        session = restarted.get_session(SESSION_ID)["session"]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            session = restarted.get_session(SESSION_ID)["session"]
+            if session["controlMode"] == "external":
+                break
+            time.sleep(0.01)
         self.assertTrue(session["busy"])
         self.assertEqual(session["controlMode"], "external")
         self.assertEqual(session["activeTurnId"], "turn-external-new")
@@ -1021,6 +1027,21 @@ class GatewayServiceTest(unittest.TestCase):
             "active",
         )
 
+    def test_duplicate_start_after_coordinator_restart_returns_same_run(self) -> None:
+        payload = {"requestId": "restart-duplicate", "sessionId": SESSION_ID, "prompt": "do once"}
+        first = self.gateway.start_run(payload)
+        self.assertEqual(len(self.transport.starts), 1)
+
+        restarted = GatewayService(
+            SqliteGatewayStore(Path(self.temporary.name) / "runtime.sqlite3"),
+            self.transport,
+        )
+        second = restarted.start_run(payload)
+
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["run"]["gatewayRunId"], first["run"]["gatewayRunId"])
+        self.assertEqual(len(self.transport.starts), 1)
+
     def test_single_active_run_and_terminal_callback_release_session(self) -> None:
         first = self.gateway.start_run({"requestId": "action-1", "sessionId": SESSION_ID, "prompt": "报告一"})
         started_at = first["run"]["startedAt"]
@@ -1084,7 +1105,7 @@ class GatewayHttpTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         transport = FakeTransport()
-        gateway = GatewayService(JsonGatewayStore(Path(self.temporary.name) / "gateway.json"), transport)
+        gateway = GatewayService(SqliteGatewayStore(Path(self.temporary.name) / "runtime.sqlite3"), transport)
         gateway.put_session(SESSION_ID, session_config())
         self.server = GatewayHttpServer(("127.0.0.1", 0), gateway)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -1226,7 +1247,7 @@ input.on("line", (line) => {
             log_dir=self.root / "logs",
             startup_timeout_seconds=2,
         )
-        gateway = GatewayService(JsonGatewayStore(self.root / f"{mode}.json"), transport)
+        gateway = GatewayService(SqliteGatewayStore(self.root / f"{mode}.sqlite3"), transport)
         gateway.put_session(SESSION_ID, session_config())
         return gateway, transport
 
