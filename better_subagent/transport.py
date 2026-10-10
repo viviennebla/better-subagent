@@ -235,6 +235,26 @@ class AppServerTransport:
             params["cursor"] = cursor
         return self.request("thread/turns/list", params)
 
+    def list_thread_items(
+        self,
+        thread_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+        sort_direction: str = "desc",
+    ) -> dict[str, Any]:
+        self._ensure_connected()
+        if sort_direction not in {"asc", "desc"}:
+            raise ValueError("invalid item sort direction")
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": sort_direction,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        return self.request("thread/items/list", params)
+
     def resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:
         return self.request("thread/resume", params)
 
