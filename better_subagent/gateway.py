@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .codex_agent import build_agent_tree_page, project_collaboration_entry, project_thread_agent
+from .codex_agent import build_agent_tree_page, project_collaboration_entry, project_thread_agent, project_transcript_turn
 from .contracts import (
     OCCUPYING_RUN_STATUSES,
     TERMINAL_RUN_STATUSES,
@@ -637,6 +637,37 @@ class GatewayService:
             "trees": build_agent_tree_page(page["data"]),
             "nextCursor": next_cursor,
             "partial": next_cursor is not None or cursor is not None,
+        }
+
+    def codex_thread_transcript(
+        self, thread_id: str, *, cursor: str | None = None, limit: int = 5
+    ) -> dict[str, Any]:
+        """Read any persisted native Thread, including unregistered V2 children."""
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 160:
+            raise GatewayError("validation_error", "threadId 无效", status=422)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10:
+            raise GatewayError("validation_error", "limit 必须在 1 到 10 之间", status=422)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        lister = getattr(self.transport, "list_thread_turns", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持分页 Thread 历史", status=501)
+        try:
+            page = lister(thread_id, cursor=cursor, limit=limit, items_view="full", sort_direction="desc")
+        except Exception as exc:
+            raise GatewayError("history_unavailable", "Codex Thread 历史读取失败", status=502,
+                               details={"reason": str(exc)[:500]}) from exc
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            raise GatewayError("history_incompatible", "Codex Thread 历史格式无效", status=502)
+        next_cursor = page.get("nextCursor")
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor):
+            raise GatewayError("history_incompatible", "Codex Thread 历史游标无效", status=502)
+        return {
+            "threadId": thread_id,
+            "turns": [project_transcript_turn(t) for t in page["data"] if isinstance(t, dict)],
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor is not None,
+            "order": "desc",
         }
 
     def codex_communications(
