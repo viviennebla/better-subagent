@@ -37,4 +37,18 @@
 - [#33885：V2 Subagent 不允许直接修正/steer](https://github.com/openai/codex/issues/33885)
 - [#28058：加密的 Agent 间消息缺少可读审计记录](https://github.com/openai/codex/issues/28058)
 
-下一步：基于 App Server 的 paginated Turn/Item 形成可区分可读/不可读的协作时间线；再讨论 Human Intervention。不能绕过服务端已拒绝的直接输入权限。
+## 已实现的只读接口（PR #4）
+
+- `GET /v1/codex/agent-tree?limit=100&cursor=...`：基于 `thread/list` 的单页 Agent Tree 分组，返回 `trees[]`、`nextCursor` 与 `partial`。每个树含 `rootThreadIds`、`unresolvedParentThreadIds`，每个 Thread 含 `childrenThreadIds` 与 `parentInPage`。**这不是完整 Agent Tree 的保证**：父 Thread 可能在别的分页或根本未出现在列表中。
+- `GET /v1/codex/threads/{threadId}/communications?limit=50&cursor=...`：基于 `thread/items/list` 的单页历史，`desc` 顺序，只投影上游 `collabAgentToolCall` 和 `subAgentActivity`。返回 `events[]`、`scannedItems`、`nextCursor`、`hasMore`。可以用 nextCursor 继续读取更早的记录。
+- 协作工具的 `prompt` 有原始字符串时标记 `messageVisibility=readable`；字段不存在或为 null 时标记 `unavailable`，**不能断言它必然是加密**。活动事件标记 `notApplicable`。普通 `agentMessage` 不会被错误归类为 Agent 间通信。
+- 接口不注册 Session、不启动 Turn、不持久化重复历史，也不绕过上游 V2 `canAcceptDirectInput`。
+- 两个接口每页限制 1–100 条原生记录。过滤发生在原生 items 分页之后，因此**空的 events 页不等于没有协作消息**；需结合 `hasMore` 继续翻页。
+
+## 尚未实现
+
+- UI 中跨页合并整棵 Agent Tree；Agent Tree API 当前输出每页局部结构。
+- 可完整审计的所有消息正文：加密载荷若无上游审计副本，无法在 Gateway 还原。
+- 用户直接对 V2 Parent-owned Subagent 发指令；仍受原生 App Server 权限约束。
+
+下一步建议由 Board/Workbench 消费这两个接口进行只读展示，先验证用户实际浏览体验，再单独讨论 Human Intervention。
