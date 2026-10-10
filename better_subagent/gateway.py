@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .codex_agent import project_thread_agent
 from .contracts import (
     OCCUPYING_RUN_STATUSES,
     TERMINAL_RUN_STATUSES,
@@ -436,9 +437,10 @@ class GatewayService:
             "sandboxPolicy": sandbox,
             "runtimeStatus": (thread.get("status") or {}).get("type") if isinstance(thread.get("status"), dict) else thread.get("status", "notLoaded"),
         }
+        resolved.update(project_thread_agent(thread))
         if resolved["runtimeStatus"] in {"active", "waitingOnApproval"}:
             resolved.update({"controlMode": "external", "requestedControlMode": "external"})
-        if thread.get("canAcceptDirectInput") is False:
+        if resolved["canAcceptDirectInput"] is False:
             resolved.update({
                 "enabled": False,
                 "unavailableReason": "Codex App Server 标记该 Session 不接受直接输入",
@@ -472,6 +474,14 @@ class GatewayService:
         except Exception as exc:
             raise GatewayError("runtime_unavailable", "App Server thread/read 读取失败", status=502, details={"threadId": thread_id, "reason": str(exc)[:1000]}) from exc
         thread = response.get("thread") if isinstance(response, dict) and isinstance(response.get("thread"), dict) else response
+        # Manual registration must not bypass V2 parent-owned input policy.
+        if isinstance(thread, dict) and thread.get("canAcceptDirectInput") is False:
+            raise GatewayError(
+                "direct_input_not_allowed",
+                "Codex App Server 不允许向此 Thread 直接发送输入",
+                status=409,
+                details={"threadId": thread_id, "directInputStatus": "denied"},
+            )
         raw_status = thread.get("status") if isinstance(thread, dict) else None
         status = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
         if status not in {"idle", "notLoaded", None}:
@@ -652,6 +662,7 @@ class GatewayService:
                 "sessionId": session_id,
                 "sessionRootId": session_root_id,
                 "threadId": thread_id,
+                **project_thread_agent(thread),
                 "name": main_work,
                 "mainWork": main_work,
                 "preview": preview,
@@ -935,7 +946,7 @@ class GatewayService:
                 raise GatewayError("session_busy", "运行中的 Session 配置不能修改", status=409)
             previous = board["sessions"].get(session_id)
             if isinstance(previous, dict):
-                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration")
+                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration", "sessionTreeId", "parentThreadId", "forkedFromId", "agentRole", "agentNickname", "threadSource", "canAcceptDirectInput", "directInputStatus")
                 if not minimal_runtime:
                     preserved += ("runtimeStatus", "activeTurnId", "effectivePolicy", "policySource", "policyUpdatedAt")
                 for key in preserved:
