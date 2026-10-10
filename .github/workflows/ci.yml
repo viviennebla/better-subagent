@@ -46,3 +46,22 @@ jobs:
 
       - name: Check whitespace
         run: git diff --check
+
+  deploy:
+    name: Deploy production
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: [self-hosted, linux, x64, codex-family-prod, codex-family]
+    timeout-minutes: 20
+
+    steps:
+      - name: Deploy tested Gateway commit
+        env:
+          CODEX_FAMILY_EXPECTED_SHA: ${{ github.sha }}
+        run: /bin/bash /home/feiyan/workspace/codex-family/deploy/deploy.sh better-subagent
+
+      - name: Deployment summary
+        run: |
+          echo "### Better Subagent deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- host: vimo-dev-server" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
