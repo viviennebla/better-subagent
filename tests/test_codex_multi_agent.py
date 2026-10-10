@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from better_subagent.codex_agent import build_agent_tree_page, project_collaboration_entry
+from better_subagent.codex_agent import build_agent_tree_page, project_collaboration_entry, project_transcript_turn
 from better_subagent.contracts import GatewayError
 from better_subagent.gateway import GatewayService
 from better_subagent.server import GatewayHttpServer
@@ -114,6 +114,50 @@ class AgentProjectionTest(unittest.TestCase):
         self.assertEqual(build_agent_tree_page([{"id": "root", "sessionId": "root"},
                                                 {"id": "child", "sessionId": "root",
                                                  "parentThreadId": "root"}])[0]["threads"][0]["childrenThreadIds"], ["child"])
+
+    def test_read_unregistered_subagent_transcript_with_native_turn_pagination(self):
+        def list_turns(thread_id, *, cursor=None, limit=5, items_view="full", sort_direction="desc"):
+            self.assertEqual(thread_id, "child")
+            self.assertEqual(items_view, "full")
+            self.assertEqual(sort_direction, "desc")
+            self.assertEqual(limit, 5)
+            self.assertIsNone(cursor)
+            return {"data": [{
+                "id": "turn-1", "status": "completed", "itemsView": "full",
+                "items": [
+                    {"id": "u", "type": "userMessage", "content": [{"type": "text", "text": "Please review"}]},
+                    {"id": "a", "type": "agentMessage", "text": "Review complete"},
+                    {"id": "collab", "type": "collabAgentToolCall", "tool": "sendMessage",
+                     "senderThreadId": "child", "receiverThreadIds": ["root"], "prompt": None},
+                    {"id": "exec", "type": "commandExecution", "command": "pytest -q",
+                     "aggregatedOutput": "SECRET_UNSAFE_TO_COPY", "status": "completed"},
+                ],
+            }], "nextCursor": "older"}
+        self.transport.list_thread_turns = list_turns
+        result = self.gateway.codex_thread_transcript("child")
+        self.assertEqual(result["threadId"], "child")
+        self.assertEqual(result["nextCursor"], "older")
+        items = result["turns"][0]["items"]
+        self.assertEqual(items[0]["text"], "Please review")
+        self.assertEqual(items[1]["text"], "Review complete")
+        self.assertEqual(items[2]["visibility"], "unavailable")
+        self.assertIsNone(items[2]["text"])
+        self.assertEqual(items[3]["text"], "pytest -q")
+        self.assertNotIn("SECRET_UNSAFE_TO_COPY", str(result))
+
+    def test_transcript_rejects_invalid_page_and_does_not_expose_reasoning(self):
+        turn = {"id": "t", "items": [
+            {"id": "r", "type": "reasoning", "content": ["private thoughts"]},
+            {"id": "x", "type": "other", "secret": "opaque-data"}
+        ]}
+        projected = project_transcript_turn(turn)
+        self.assertIsNone(projected["items"][0]["text"])
+        self.assertNotIn("private thoughts", str(projected))
+        self.assertNotIn("opaque-data", str(projected))
+        with self.assertRaises(GatewayError):
+            self.gateway.codex_thread_transcript("child", limit=11)
+        with self.assertRaises(GatewayError):
+            self.gateway.codex_thread_transcript("child", cursor="")
 
     def test_invalid_query_and_cursor_fail_explicitly(self):
         with self.assertRaises(GatewayError) as cm:
