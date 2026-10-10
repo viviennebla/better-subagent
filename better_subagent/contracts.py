@@ -279,6 +279,14 @@ def session_summary(session: dict[str, Any], runs: list[dict[str, Any]], *, pend
         "agentId": session.get("agentId"),
         "environment": session.get("environment"),
         "controlGeneration": session.get("controlGeneration", 1),
+        "sessionTreeId": session.get("sessionTreeId"),
+        "parentThreadId": session.get("parentThreadId"),
+        "forkedFromId": session.get("forkedFromId"),
+        "agentRole": session.get("agentRole"),
+        "agentNickname": session.get("agentNickname"),
+        "threadSource": session.get("threadSource"),
+        "canAcceptDirectInput": session.get("canAcceptDirectInput"),
+        "directInputStatus": session.get("directInputStatus", "unknown"),
     }
 
 
