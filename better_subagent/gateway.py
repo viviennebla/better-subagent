@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .codex_agent import project_thread_agent
+from .codex_agent import build_agent_tree_page, project_collaboration_entry, project_thread_agent
 from .contracts import (
     OCCUPYING_RUN_STATUSES,
     TERMINAL_RUN_STATUSES,
@@ -610,6 +610,75 @@ class GatewayService:
         summaries = [session_summary(session, board["runs"], pending_approval_count=len(self._pending_for_session(board, session))) for session in board["sessions"].values()]
         summaries.sort(key=lambda item: (item["role"], item["owner"], item["sessionId"]))
         return {"sessions": summaries}
+
+    def codex_agent_tree(self, *, cursor: str | None = None, limit: int = 100) -> dict[str, Any]:
+        """Read one bounded native Thread inventory page as Agent Tree groups.
+
+        A page is not a complete Session tree: its root or parent may be on
+        another page. The consumer must respect nextCursor and missing parents.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise GatewayError("validation_error", "limit 必须在 1 到 100 之间", status=422)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        lister = getattr(self.transport, "list_threads", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 Codex Thread 列表", status=501)
+        try:
+            page = lister(limit=limit, **({"cursor": cursor} if cursor is not None else {}))
+        except Exception as exc:
+            raise GatewayError("tree_unavailable", "Codex Agent Tree 读取失败", status=502, details={"reason": str(exc)[:500]}) from exc
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            raise GatewayError("tree_incompatible", "Codex Agent Tree 返回的数据无效", status=502)
+        next_cursor = page.get("nextCursor")
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor):
+            raise GatewayError("tree_incompatible", "Codex Agent Tree cursor 无效", status=502)
+        return {
+            "trees": build_agent_tree_page(page["data"]),
+            "nextCursor": next_cursor,
+            "partial": next_cursor is not None or cursor is not None,
+        }
+
+    def codex_communications(
+        self, thread_id: str, *, cursor: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        """Read-only collaboration events in one page of the native item history.
+
+        Items are filtered AFTER paging. An empty page is not proof that a
+        thread has no collaboration, nor that ciphertext can be decrypted.
+        """
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 160:
+            raise GatewayError("validation_error", "threadId 无效", status=422)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise GatewayError("validation_error", "limit 必须在 1 到 100 之间", status=422)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        lister = getattr(self.transport, "list_thread_items", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 thread/items/list", status=501)
+        try:
+            page = lister(thread_id, cursor=cursor, limit=limit, sort_direction="desc")
+        except Exception as exc:
+            raise GatewayError("communication_unavailable", "Codex 协作历史读取失败", status=502, details={"reason": str(exc)[:500]}) from exc
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            raise GatewayError("communication_incompatible", "Codex 协作历史格式无效", status=502)
+        next_cursor = page.get("nextCursor")
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor):
+            raise GatewayError("communication_incompatible", "Codex 协作历史 cursor 无效", status=502)
+        events = [
+            projected for entry in page["data"]
+            if isinstance(entry, dict)
+            for projected in [project_collaboration_entry(entry)]
+            if projected is not None
+        ]
+        return {
+            "threadId": thread_id,
+            "events": events,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor is not None,
+            "scannedItems": len(page["data"]),
+            "order": "desc",
+        }
 
     def sessions_overview(self) -> dict[str, Any]:
         lister = getattr(self.transport, "list_threads", None)
