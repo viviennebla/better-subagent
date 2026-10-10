@@ -119,3 +119,72 @@ def project_collaboration_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
         "message": text if readable else None,
     })
     return base
+
+def project_transcript_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Small, truthful UI-facing projection of a persisted Codex ThreadItem.
+
+    Opaque/unrecognized items remain labeled, never reported as user dialogue.
+    Large tool outputs are summarized rather than sent to browser.
+    """
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    if not isinstance(kind, str):
+        return None
+    projected: dict[str, Any] = {
+        "id": item.get("id") if isinstance(item.get("id"), str) else None,
+        "type": kind,
+        "text": None,
+        "visibility": "notApplicable",
+    }
+    if kind == "userMessage":
+        parts = [
+            p.get("text") for p in item.get("content", [])
+            if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
+        ] if isinstance(item.get("content"), list) else []
+        projected.update(text="\n".join(parts)[:16000] if parts else None,
+                         visibility="readable" if parts else "unavailable")
+    elif kind in {"agentMessage", "plan"}:
+        value = item.get("text")
+        projected.update(text=value[:16000] if isinstance(value, str) else None,
+                         visibility="readable" if isinstance(value, str) else "unavailable")
+    elif kind == "reasoning":
+        # Never present hidden reasoning as a visible transcript.
+        summaries = item.get("summary")
+        content = [v for v in summaries if isinstance(v, str)] if isinstance(summaries, list) else []
+        projected.update(text="\n".join(content)[:2000] if content else None,
+                         visibility="readable" if content else "unavailable")
+    elif kind in {"collabAgentToolCall", "subAgentActivity"}:
+        value = project_collaboration_entry({"turnId": "_", "item": item})
+        if value is not None:
+            projected.update({
+                "text": value.get("message"),
+                "visibility": value["messageVisibility"],
+                "collaboration": {k: v for k, v in value.items()
+                                  if k not in {"message", "startedAtMs", "completedAtMs", "turnId"}},
+            })
+    elif kind == "commandExecution":
+        cmd = item.get("command")
+        projected.update(text=cmd[:2000] if isinstance(cmd, str) else None,
+                         visibility="readable" if isinstance(cmd, str) else "unavailable",
+                         status=item.get("status"))
+    elif kind in {"fileChange", "mcpToolCall", "dynamicToolCall"}:
+        projected["status"] = item.get("status")
+    return projected
+
+
+def project_transcript_turn(turn: dict[str, Any]) -> dict[str, Any]:
+    raw_items = turn.get("items")
+    items = [v for item in raw_items
+             if isinstance(item, dict)
+             for v in [project_transcript_item(item)]
+             if v is not None] if isinstance(raw_items, list) else []
+    return {
+        "turnId": turn.get("id"),
+        "rootTurnId": turn.get("rootTurnId"),
+        "status": turn.get("status"),
+        "startedAt": turn.get("startedAt"),
+        "completedAt": turn.get("completedAt"),
+        "itemsView": turn.get("itemsView"),
+        "items": items,
+    }
