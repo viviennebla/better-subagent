@@ -946,7 +946,7 @@ class GatewayService:
                 raise GatewayError("session_busy", "运行中的 Session 配置不能修改", status=409)
             previous = board["sessions"].get(session_id)
             if isinstance(previous, dict):
-                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration", "sessionTreeId", "parentThreadId", "forkedFromId", "agentRole", "agentNickname", "threadSource", "canAcceptDirectInput", "directInputStatus")
+                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration")
                 if not minimal_runtime:
                     preserved += ("runtimeStatus", "activeTurnId", "effectivePolicy", "policySource", "policyUpdatedAt")
                 for key in preserved:
