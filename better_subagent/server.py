@@ -34,6 +34,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 **self._page_options(default_limit=100)
             ), HTTPStatus.OK, body=False)
             return
+        transcript_prefix = "/v1/codex/threads/"
+        transcript_suffix = "/transcript"
+        if path.startswith(transcript_prefix) and path.endswith(transcript_suffix):
+            thread_id = unquote(path[len(transcript_prefix):-len(transcript_suffix)].rstrip("/"))
+            if not thread_id or "/" in thread_id:
+                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, GatewayError("validation_error", "threadId 无效", status=422).to_dict())
+                return
+            self._handle(lambda _payload: self.gateway.codex_thread_transcript(
+                thread_id, **self._page_options(default_limit=5)
+            ), HTTPStatus.OK, body=False)
+            return
         collab_prefix = "/v1/codex/threads/"
         collab_suffix = "/communications"
         if path.startswith(collab_prefix) and path.endswith(collab_suffix):
