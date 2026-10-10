@@ -48,7 +48,7 @@ Thread / Turn
                            |
                            | existing HTTP contract
                            v
-                better-subagent Coordinator
+                better-subagent Gateway
                 ---------------------------
                 Device Registry
                 Session Registry
@@ -70,15 +70,15 @@ Thread / Turn
         Codex App Server          Codex App Server
 ```
 
-Coordinator 是 Board 唯一访问的 runtime endpoint。
+Gateway 是 Board 唯一访问的 runtime endpoint。
 
 Board 不直接知道 Device Agent URL。
 
 ## 3. 进程拆分
 
-### Coordinator
+### Gateway
 
-沿用 `better-subagent` 服务入口，逐步改造成 Coordinator。
+沿用 `better-subagent` 服务入口，逐步改造成 Gateway。
 
 职责：
 
@@ -100,11 +100,11 @@ better-subagent-agent
 职责：
 
 - 加载稳定 device identity；
-- 主动连接 Coordinator；
+- 主动连接 Gateway；
 - heartbeat；
 - 维护本机 App Server transport；
 - 解析本机 Session runtime；
-- 执行 Coordinator command；
+- 执行 Gateway command；
 - 本地幂等；
 - 本地 event outbox；
 - reconnect / replay。
@@ -115,7 +115,7 @@ Device Agent 不保存 Board Task 或 Ledger。
 
 V1 不引入外部数据库。
 
-Coordinator 使用 Python 标准库 SQLite：
+Gateway 使用 Python 标准库 SQLite：
 
 ```text
 data/runtime.sqlite3
@@ -271,11 +271,11 @@ deviceId 不应随进程重启变化。
 
 ### processed_commands
 
-保存最近 commandId 与 execution identity，用于 Coordinator 重发后的幂等返回。
+保存最近 commandId 与 execution identity，用于 Gateway 重发后的幂等返回。
 
 ### event_outbox
 
-runtime event 在本地先持久化，再发送 Coordinator；收到 Coordinator ACK 后删除/压缩。
+runtime event 在本地先持久化，再发送 Gateway；收到 Gateway ACK 后删除/压缩。
 
 这样：
 
@@ -289,14 +289,14 @@ Turn completed
 
 terminal 不丢。
 
-## 6. Coordinator ↔ Device Agent 协议
+## 6. Gateway ↔ Device Agent 协议
 
 内部协议不使用 MCP。
 
 推荐一个长期 outbound WebSocket：
 
 ```text
-Device Agent → Coordinator
+Device Agent → Gateway
 ```
 
 Device 不需要开放入站端口。
@@ -315,7 +315,7 @@ Device 不需要开放入站端口。
 }
 ```
 
-Coordinator 返回 connectionGeneration。
+Gateway 返回 connectionGeneration。
 
 同 deviceId 新连接建立后，旧 connectionGeneration 失效。
 
@@ -323,7 +323,7 @@ Coordinator 返回 connectionGeneration。
 
 建议 10 秒一次。
 
-Coordinator 30 秒未观察到 heartbeat 后标记 offline。
+Gateway 30 秒未观察到 heartbeat 后标记 offline。
 
 具体时间做配置，不作为协议字段。
 
@@ -367,7 +367,7 @@ ACK 只说明 Device Agent 已接管 command，不表示 Run terminal。
 }
 ```
 
-Coordinator ACK：
+Gateway ACK：
 
 ```json
 {
@@ -386,7 +386,7 @@ Board 调：
 POST /v1/runs
 ```
 
-Coordinator transaction：
+Gateway transaction：
 
 1. 校验 Session / Device；
 2. requestId 幂等检查；
@@ -430,7 +430,7 @@ run.failed
 run.interrupted
 ```
 
-Coordinator transaction：
+Gateway transaction：
 
 - event dedupe；
 - Run terminal；
@@ -440,7 +440,7 @@ Coordinator transaction：
 
 ## 8. Idempotency
 
-### Coordinator
+### Gateway
 
 `requestId` 继续是 StartRun 的业务幂等键。
 
@@ -497,7 +497,7 @@ rejected: stale_generation
 
 每个 Device Agent 只连接本机 App Server。
 
-Coordinator 永远不直接访问远程 App Server socket。
+Gateway 永远不直接访问远程 App Server socket。
 
 现有：
 
@@ -507,13 +507,13 @@ AppServerTransport
 
 应尽量下沉到 Device Agent 复用，不重写 RPC 校准逻辑。
 
-Device Agent 将 App Server 原始事件归一化为 runtime event 后再发 Coordinator。
+Device Agent 将 App Server 原始事件归一化为 runtime event 后再发 Gateway。
 
 ## 11. Session discovery
 
-Device Agent 周期性/事件驱动读取本机 App Server thread inventory，并上报 Coordinator。
+Device Agent 周期性/事件驱动读取本机 App Server thread inventory，并上报 Gateway。
 
-Coordinator 的 `GET /v1/sessions` 仍输出可调度 Session，但新增：
+Gateway 的 `GET /v1/sessions` 仍输出可调度 Session，但新增：
 
 ```json
 {
@@ -553,7 +553,7 @@ Device reconnect 后可按 exact command / App Server turn identity reconcile。
 
 ### Device offline during active Run
 
-Coordinator：
+Gateway：
 
 ```text
 Run 保持 active/unknown projection
@@ -590,7 +590,7 @@ Verification Task 的自动创建与 PASS/FAIL workflow 不属于本仓库。
 
 MCP 建议在 core runtime 稳定后实现。
 
-MCP server 直接调用 Coordinator application service，不复制状态。
+MCP server 直接调用 Gateway application service，不复制状态。
 
 初始工具：
 
@@ -631,7 +631,7 @@ V1 不额外开多个公开端口。
 
 ### Phase 1 — SQLite single-device parity
 
-把当前 JSON registry / Run store 迁到 Coordinator SQLite。
+把当前 JSON registry / Run store 迁到 Gateway SQLite。
 
 仍只有本机 App Server。
 
@@ -644,15 +644,17 @@ V1 不额外开多个公开端口。
 
 ### Phase 2 — local Device Agent
 
-在同一台机器上启动：
+实现说明：Phase 2 先建立 Gateway → LocalDeviceAgent → AppServerTransport 的明确代码 ownership boundary 和 Device / Agent durable model。LocalDeviceAgent 与 Gateway 暂时同进程，不为了本机拆进程提前增加一套临时 IPC；Phase 3 引入 durable remote command/event protocol 时再把该 boundary 进程化。
+
+逻辑拓扑仍为：
 
 ```text
-Coordinator
+Gateway
 Device Agent
 App Server
 ```
 
-Coordinator 不再直接创建 AppServerTransport。
+Gateway 不再直接创建 AppServerTransport。
 
 验收现有 start/steer/interrupt/approval/handoff/reclaim 全通过。
 
@@ -692,8 +694,8 @@ Verification Task
 | Case | Expected |
 | --- | --- |
 | duplicate start command | one App Server Turn |
-| Coordinator restart with queued command | command survives |
-| Coordinator restart after Device ACK | no duplicate Turn |
+| Gateway restart with queued command | command survives |
+| Gateway restart after Device ACK | no duplicate Turn |
 | Device restart before ACK | redelivery + idempotent |
 | Device disconnect after turn.started | no automatic replay |
 | terminal while disconnected | event outbox replays |
@@ -703,7 +705,7 @@ Verification Task
 | offline target Device | Session unavailable, queue durable |
 | remote approval | routed to original target Device |
 | interrupt | routed to original target Device |
-| Coordinator event duplicate | one state transition |
+| Gateway event duplicate | one state transition |
 | App Server exact Turn missing after reconnect | fail closed unknown |
 
 ## 18. 代码组织建议
@@ -712,7 +714,7 @@ Verification Task
 
 ```text
 better_subagent/
-├─ coordinator.py
+├─ gateway.py
 ├─ device_agent.py
 ├─ storage.py
 ├─ protocol.py
@@ -727,9 +729,9 @@ better_subagent/
 建议边界：
 
 - `storage.py`：SQLite transaction；
-- `protocol.py`：Coordinator ↔ Device wire schema；
+- `protocol.py`：Gateway ↔ Device wire schema；
 - `device_agent.py`：local App Server + command/event；
-- `coordinator.py`：routing / leasing / projection；
+- `gateway.py`：routing / leasing / projection；
 - `gateway.py`：现有业务 API adapter，逐步变薄。
 
 ## 19. 实施纪律
@@ -760,7 +762,7 @@ better_subagent/
 - Session / Run / approval / idempotency 全部改为 SQLite transaction；
 - 当前 HTTP contract 不变；
 - 全量现有 tests 通过；
-- 新增 Coordinator restart / duplicate request / orphan Run 测试；
+- 新增 Gateway restart / duplicate request / orphan Run 测试；
 - 不引入 Device Agent。
 
 只有这个 PR 合并后，再开始 Phase 2。

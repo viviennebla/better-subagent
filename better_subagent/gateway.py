@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .codex_agent import build_agent_tree_page, project_collaboration_entry, project_thread_agent
 from .contracts import (
     OCCUPYING_RUN_STATUSES,
     TERMINAL_RUN_STATUSES,
@@ -80,6 +81,7 @@ class GatewayService:
     def __init__(self, store: SqliteGatewayStore, transport: GatewayTransport) -> None:
         self.store = store
         self.transport = transport
+        self._ensure_local_device_projection()
         self._live_run_ids: set[str] = set()
         self._run_reconcile_inflight: set[str] = set()
         self._run_reconcile_after: dict[str, float] = {}
@@ -96,6 +98,58 @@ class GatewayService:
         # a Gateway restart. Reconcile them from exact App Server Turn facts;
         # failures remain fail-closed and must not prevent Gateway startup.
         self._reconcile_orphaned_runs()
+
+    def _local_device_identity(self) -> dict[str, Any] | None:
+        device_id = getattr(self.transport, "device_id", None)
+        agent_id = getattr(self.transport, "agent_id", None)
+        environment = getattr(self.transport, "environment", None)
+        if not all(isinstance(item, str) and item for item in (device_id, agent_id, environment)):
+            return None
+        return {
+            "deviceId": device_id,
+            "agentId": agent_id,
+            "environment": environment,
+            "controlGeneration": 1,
+        }
+
+    def _ensure_local_device_projection(self) -> None:
+        identity = self._local_device_identity()
+        if identity is None:
+            return
+        device_record = getattr(self.transport, "device_record", None)
+        agent_record = getattr(self.transport, "agent_record", None)
+        if callable(device_record):
+            self.store.upsert_device(device_record())
+        if callable(agent_record):
+            self.store.upsert_agent(agent_record())
+        with self.store.locked() as board:
+            changed = False
+            for session in board["sessions"].values():
+                for key, value in identity.items():
+                    if key not in session:
+                        session[key] = value
+                        changed = True
+            for run in board["runs"]:
+                session = board["sessions"].get(run.get("sessionId"), {})
+                if not isinstance(session, dict):
+                    continue
+                defaults = {
+                    "targetDeviceId": session.get("deviceId", identity["deviceId"]),
+                    "targetAgentId": session.get("agentId", identity["agentId"]),
+                    "controlGeneration": session.get("controlGeneration", 1),
+                }
+                for key, value in defaults.items():
+                    if key not in run:
+                        run[key] = value
+                        changed = True
+            if changed:
+                self.store.save(board)
+
+    def list_devices(self) -> dict[str, Any]:
+        return {"devices": self.store.list_devices()}
+
+    def list_agents(self) -> dict[str, Any]:
+        return {"agents": self.store.list_agents()}
 
     def _remember_live_run(self, gateway_run_id: str) -> None:
         with self._live_run_lock:
@@ -195,6 +249,8 @@ class GatewayService:
                     )
                     if managed:
                         continue
+                    if session.get("controlMode", "managed") != "external":
+                        session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                     session.update({
                         "controlMode": "external",
                         "requestedControlMode": "external",
@@ -381,9 +437,10 @@ class GatewayService:
             "sandboxPolicy": sandbox,
             "runtimeStatus": (thread.get("status") or {}).get("type") if isinstance(thread.get("status"), dict) else thread.get("status", "notLoaded"),
         }
+        resolved.update(project_thread_agent(thread))
         if resolved["runtimeStatus"] in {"active", "waitingOnApproval"}:
             resolved.update({"controlMode": "external", "requestedControlMode": "external"})
-        if thread.get("canAcceptDirectInput") is False:
+        if resolved["canAcceptDirectInput"] is False:
             resolved.update({
                 "enabled": False,
                 "unavailableReason": "Codex App Server 标记该 Session 不接受直接输入",
@@ -417,6 +474,14 @@ class GatewayService:
         except Exception as exc:
             raise GatewayError("runtime_unavailable", "App Server thread/read 读取失败", status=502, details={"threadId": thread_id, "reason": str(exc)[:1000]}) from exc
         thread = response.get("thread") if isinstance(response, dict) and isinstance(response.get("thread"), dict) else response
+        # Manual registration must not bypass V2 parent-owned input policy.
+        if isinstance(thread, dict) and thread.get("canAcceptDirectInput") is False:
+            raise GatewayError(
+                "direct_input_not_allowed",
+                "Codex App Server 不允许向此 Thread 直接发送输入",
+                status=409,
+                details={"threadId": thread_id, "directInputStatus": "denied"},
+            )
         raw_status = thread.get("status") if isinstance(thread, dict) else None
         status = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
         if status not in {"idle", "notLoaded", None}:
@@ -535,6 +600,8 @@ class GatewayService:
                     )
                     if managed:
                         continue
+                    if session.get("controlMode", "managed") != "external":
+                        session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                     session.update({"controlMode": "external", "requestedControlMode": "external", "runtimeStatus": "active", "activeTurnId": turn_id, "updatedAt": now_iso()})
             self.store.save(board)
 
@@ -543,6 +610,75 @@ class GatewayService:
         summaries = [session_summary(session, board["runs"], pending_approval_count=len(self._pending_for_session(board, session))) for session in board["sessions"].values()]
         summaries.sort(key=lambda item: (item["role"], item["owner"], item["sessionId"]))
         return {"sessions": summaries}
+
+    def codex_agent_tree(self, *, cursor: str | None = None, limit: int = 100) -> dict[str, Any]:
+        """Read one bounded native Thread inventory page as Agent Tree groups.
+
+        A page is not a complete Session tree: its root or parent may be on
+        another page. The consumer must respect nextCursor and missing parents.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise GatewayError("validation_error", "limit 必须在 1 到 100 之间", status=422)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        lister = getattr(self.transport, "list_threads", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 Codex Thread 列表", status=501)
+        try:
+            page = lister(limit=limit, **({"cursor": cursor} if cursor is not None else {}))
+        except Exception as exc:
+            raise GatewayError("tree_unavailable", "Codex Agent Tree 读取失败", status=502, details={"reason": str(exc)[:500]}) from exc
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            raise GatewayError("tree_incompatible", "Codex Agent Tree 返回的数据无效", status=502)
+        next_cursor = page.get("nextCursor")
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor):
+            raise GatewayError("tree_incompatible", "Codex Agent Tree cursor 无效", status=502)
+        return {
+            "trees": build_agent_tree_page(page["data"]),
+            "nextCursor": next_cursor,
+            "partial": next_cursor is not None or cursor is not None,
+        }
+
+    def codex_communications(
+        self, thread_id: str, *, cursor: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        """Read-only collaboration events in one page of the native item history.
+
+        Items are filtered AFTER paging. An empty page is not proof that a
+        thread has no collaboration, nor that ciphertext can be decrypted.
+        """
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 160:
+            raise GatewayError("validation_error", "threadId 无效", status=422)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise GatewayError("validation_error", "limit 必须在 1 到 100 之间", status=422)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        lister = getattr(self.transport, "list_thread_items", None)
+        if not callable(lister):
+            raise GatewayError("transport_unsupported", "当前 transport 不支持 thread/items/list", status=501)
+        try:
+            page = lister(thread_id, cursor=cursor, limit=limit, sort_direction="desc")
+        except Exception as exc:
+            raise GatewayError("communication_unavailable", "Codex 协作历史读取失败", status=502, details={"reason": str(exc)[:500]}) from exc
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            raise GatewayError("communication_incompatible", "Codex 协作历史格式无效", status=502)
+        next_cursor = page.get("nextCursor")
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor):
+            raise GatewayError("communication_incompatible", "Codex 协作历史 cursor 无效", status=502)
+        events = [
+            projected for entry in page["data"]
+            if isinstance(entry, dict)
+            for projected in [project_collaboration_entry(entry)]
+            if projected is not None
+        ]
+        return {
+            "threadId": thread_id,
+            "events": events,
+            "nextCursor": next_cursor,
+            "hasMore": next_cursor is not None,
+            "scannedItems": len(page["data"]),
+            "order": "desc",
+        }
 
     def sessions_overview(self) -> dict[str, Any]:
         lister = getattr(self.transport, "list_threads", None)
@@ -595,6 +731,7 @@ class GatewayService:
                 "sessionId": session_id,
                 "sessionRootId": session_root_id,
                 "threadId": thread_id,
+                **project_thread_agent(thread),
                 "name": main_work,
                 "mainWork": main_work,
                 "preview": preview,
@@ -798,6 +935,7 @@ class GatewayService:
                 if session.get("runtimeStatus") != "idle":
                     raise GatewayError("session_not_idle", "只有 idle Session 可以交接", status=409, request_id=request["requestId"])
                 result = {"status": "completed", "requestId": request["requestId"]}
+                session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                 session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "handoffRequestId": request["requestId"], "handoffResult": result, "lastHandoffRequestId": request["requestId"], "lastHandoffResult": result, "updatedAt": now_iso()})
                 self.store.save(board)
                 return {"session": session_summary(session, board["runs"]), "handoff": {"status": "completed", "requestId": request["requestId"]}}
@@ -855,6 +993,7 @@ class GatewayService:
             if session.get("runtimeStatus") != "idle":
                 raise GatewayError("session_not_idle", "只有 idle external Session 可以 reclaim", status=409, request_id=request["requestId"])
             result = {"status": "completed", "requestId": request["requestId"]}
+            session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
             session.update({"controlMode": "managed", "requestedControlMode": "managed", "handoffStatus": None, "handoffRequestId": None, "handoffResult": None, "lastReclaimRequestId": request["requestId"], "lastReclaimResult": result, "updatedAt": now_iso()})
             self.store.save(board)
             return {"session": session_summary(session, board["runs"]), "reclaim": result}
@@ -864,6 +1003,10 @@ class GatewayService:
         minimal_runtime = "threadId" not in record
         if minimal_runtime:
             record.update(self._resolve_minimal_runtime(session_id))
+        identity = self._local_device_identity()
+        if identity is not None:
+            for key, value in identity.items():
+                record.setdefault(key, value)
         with self.store.locked() as board:
             if any(
                 run.get("sessionId") == session_id and run.get("status") in OCCUPYING_RUN_STATUSES
@@ -872,16 +1015,25 @@ class GatewayService:
                 raise GatewayError("session_busy", "运行中的 Session 配置不能修改", status=409)
             previous = board["sessions"].get(session_id)
             if isinstance(previous, dict):
-                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult")
+                preserved = ("controlMode", "requestedControlMode", "handoffStatus", "handoffRequestId", "lastHandoffRequestId", "lastHandoffResult", "lastReclaimRequestId", "lastReclaimResult", "deviceId", "agentId", "environment", "controlGeneration")
                 if not minimal_runtime:
                     preserved += ("runtimeStatus", "activeTurnId", "effectivePolicy", "policySource", "policyUpdatedAt")
                 for key in preserved:
                     if key in previous:
                         record[key] = previous[key]
+                if record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
+                    record.update({"controlMode": "external", "requestedControlMode": "external"})
+                ownership_changed = (
+                    record.get("threadId") != previous.get("threadId")
+                    or record.get("controlMode", "managed")
+                    != previous.get("controlMode", "managed")
+                )
+                if ownership_changed:
+                    record["controlGeneration"] = int(previous.get("controlGeneration", 1)) + 1
                 comparable = lambda item: {key: value for key, value in item.items() if key not in {"updatedAt", "runtimeStatus", "activeTurnId", "effectivePolicy", "policyUpdatedAt"}}
                 if comparable(previous) == comparable(record) and (not minimal_runtime or previous.get("runtimeStatus") == record.get("runtimeStatus")):
                     return {"session": session_summary(previous, board["runs"]), "idempotent": True}
-            if record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
+            elif record.get("runtimeStatus") in {"active", "waitingOnApproval"}:
                 record.update({"controlMode": "external", "requestedControlMode": "external"})
             board["sessions"][session_id] = record
             self.store.save(board)
@@ -969,6 +1121,9 @@ class GatewayService:
                 "sessionId": request["sessionId"],
                 "promptHash": prompt_hash,
                 "status": "starting",
+                "targetDeviceId": session.get("deviceId"),
+                "targetAgentId": session.get("agentId"),
+                "controlGeneration": session.get("controlGeneration", 1),
                 "createdAt": timestamp,
                 "updatedAt": timestamp,
             }
@@ -1241,6 +1396,8 @@ class GatewayService:
                 if isinstance(session, dict) and session.get("activeTurnId") == run.get("transportTurnId"):
                     if run.get("handoffRequestId") and status == "interrupted":
                         result = {"status": "completed", "requestId": run.get("handoffRequestId")}
+                        if session.get("controlMode", "managed") != "external":
+                            session["controlGeneration"] = int(session.get("controlGeneration", 1)) + 1
                         session.update({"controlMode": "external", "requestedControlMode": "external", "handoffStatus": "completed", "runtimeStatus": "idle", "activeTurnId": None, "handoffResult": result, "lastHandoffRequestId": run.get("handoffRequestId"), "lastHandoffResult": result, "updatedAt": timestamp})
                     elif run.get("handoffRequestId"):
                         result = {"status": "failed", "requestId": run.get("handoffRequestId")}

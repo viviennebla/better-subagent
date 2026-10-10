@@ -9,12 +9,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .contracts import GatewayError
+from .device_agent import LocalDeviceAgent
 from .gateway import GatewayService
 from .storage import SqliteGatewayStore
-from .transport import AppServerTransport, CodexSdkWorkerTransport
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -28,6 +28,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._json(HTTPStatus.OK, {"ok": True, "service": "better-subagent"})
+            return
+        if path == "/v1/codex/agent-tree":
+            self._handle(lambda _payload: self.gateway.codex_agent_tree(
+                **self._page_options(default_limit=100)
+            ), HTTPStatus.OK, body=False)
+            return
+        collab_prefix = "/v1/codex/threads/"
+        collab_suffix = "/communications"
+        if path.startswith(collab_prefix) and path.endswith(collab_suffix):
+            thread_id = unquote(path[len(collab_prefix):-len(collab_suffix)].rstrip("/"))
+            if not thread_id or "/" in thread_id:
+                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, GatewayError("validation_error", "threadId 无效", status=422).to_dict())
+                return
+            self._handle(lambda _payload: self.gateway.codex_communications(
+                thread_id, **self._page_options(default_limit=50)
+            ), HTTPStatus.OK, body=False)
+            return
+        if path == "/v1/devices":
+            self._handle(lambda _payload: self.gateway.list_devices(), HTTPStatus.OK, body=False)
+            return
+        if path == "/v1/agents":
+            self._handle(lambda _payload: self.gateway.list_agents(), HTTPStatus.OK, body=False)
             return
         if path == "/v1/sessions":
             self._handle(lambda _payload: self.gateway.list_sessions(), HTTPStatus.OK, body=False)
@@ -98,6 +120,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.NOT_FOUND, GatewayError("not_found", "接口不存在", status=404).to_dict())
 
+    def _page_options(self, *, default_limit: int) -> dict[str, Any]:
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        raw_limit = query.get("limit", [str(default_limit)])[0]
+        if not raw_limit.isdecimal():
+            raise GatewayError("validation_error", "limit 必须是正整数", status=422)
+        limit = int(raw_limit)
+        if not 1 <= limit <= 100:
+            raise GatewayError("validation_error", "limit 必须在 1 到 100 之间", status=422)
+        cursor = query.get("cursor", [None])[0]
+        if cursor is not None and (not cursor or len(cursor) > 2048):
+            raise GatewayError("validation_error", "cursor 无效", status=422)
+        return {"limit": limit, "cursor": cursor}
+
     def _handle(self, action: Any, status: HTTPStatus, *, body: bool = True) -> None:
         try:
             payload: dict[str, Any] = {}
@@ -148,12 +183,24 @@ def main() -> None:
     parser.add_argument("--legacy-json", type=Path, default=None)
     parser.add_argument("--transport", choices=("sdk-worker", "app-server"), default="app-server")
     parser.add_argument("--app-server-socket", type=Path, default=Path.home() / ".codex/app-server-control/app-server-control.sock")
+    parser.add_argument("--device-id", default=None)
+    parser.add_argument("--agent-id", default=None)
+    parser.add_argument("--environment", default="local")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    transport = (
-        AppServerTransport(args.app_server_socket)
+    device_agent = (
+        LocalDeviceAgent.from_app_server(
+            args.app_server_socket,
+            device_id=args.device_id,
+            agent_id=args.agent_id,
+            environment=args.environment,
+        )
         if args.transport == "app-server"
-        else CodexSdkWorkerTransport()
+        else LocalDeviceAgent.from_sdk_worker(
+            device_id=args.device_id,
+            agent_id=args.agent_id,
+            environment=args.environment,
+        )
     )
     data_path = args.data
     legacy_json = args.legacy_json
@@ -163,7 +210,7 @@ def main() -> None:
     elif legacy_json is None:
         candidate = data_path.with_name("better-subagent.json")
         legacy_json = candidate if candidate.exists() else None
-    gateway = GatewayService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), transport)
+    gateway = GatewayService(SqliteGatewayStore(data_path, legacy_json_path=legacy_json), device_agent)
     server = GatewayHttpServer((args.host, args.port), gateway)
     logging.info("better-subagent listening on http://%s:%s", args.host, args.port)
     try:

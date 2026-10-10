@@ -1,4 +1,4 @@
-"""SQLite persistence for the single-device Coordinator runtime."""
+"""SQLite persistence for the single-device Gateway runtime."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ class SqliteGatewayStore:
     Server transport behavior.
     """
 
-    SCHEMA_VERSION = 1
+    DATABASE_SCHEMA_VERSION = 2
+    STATE_SCHEMA_VERSION = 1
 
     def __init__(self, path: Path, *, legacy_json_path: Path | None = None) -> None:
         self.path = path
@@ -65,6 +66,20 @@ class SqliteGatewayStore:
                     request_id TEXT PRIMARY KEY,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS devices (
+                    device_id TEXT PRIMARY KEY,
+                    environment TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY(device_id) REFERENCES devices(device_id)
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
@@ -72,14 +87,19 @@ class SqliteGatewayStore:
                 version = connection.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()
-                if version is not None and version[0] != str(self.SCHEMA_VERSION):
+                if version is not None and version[0] not in {"1", str(self.DATABASE_SCHEMA_VERSION)}:
                     raise RuntimeError(
-                        f"better-subagent SQLite schemaVersion 非 {self.SCHEMA_VERSION}"
+                        f"better-subagent SQLite schemaVersion 不支持: {version[0]}"
                     )
                 if version is None:
                     connection.execute(
                         "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-                        (str(self.SCHEMA_VERSION),),
+                        (str(self.DATABASE_SCHEMA_VERSION),),
+                    )
+                elif version[0] == "1":
+                    connection.execute(
+                        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                        (str(self.DATABASE_SCHEMA_VERSION),),
                     )
                 self._migrate_legacy_json_if_needed(connection)
                 connection.commit()
@@ -120,7 +140,7 @@ class SqliteGatewayStore:
 
     @staticmethod
     def _validate_state(value: Any) -> None:
-        if not isinstance(value, dict) or value.get("schemaVersion") != 1:
+        if not isinstance(value, dict) or value.get("schemaVersion") != SqliteGatewayStore.STATE_SCHEMA_VERSION:
             raise RuntimeError("better-subagent 数据文件 schemaVersion 非 1")
         if not isinstance(value.get("sessions"), dict) or not isinstance(value.get("runs"), list):
             raise RuntimeError("better-subagent 数据文件结构无效")
@@ -185,7 +205,7 @@ class SqliteGatewayStore:
             )
         }
         return {
-            "schemaVersion": self.SCHEMA_VERSION,
+            "schemaVersion": self.STATE_SCHEMA_VERSION,
             "sessions": sessions,
             "runs": runs,
             "pendingApprovals": approvals,
@@ -234,6 +254,96 @@ class SqliteGatewayStore:
                 "INSERT INTO pending_approvals(request_id, payload_json) VALUES(?, ?)",
                 (str(request_id), json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
             )
+
+
+    def upsert_device(self, record: dict[str, Any]) -> None:
+        device_id = record.get("deviceId")
+        environment = record.get("environment")
+        status = record.get("status")
+        if not all(isinstance(item, str) and item for item in (device_id, environment, status)):
+            raise RuntimeError("Device identity 结构无效")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO devices(device_id, environment, status, payload_json)
+                   VALUES(?, ?, ?, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                     environment=excluded.environment,
+                     status=excluded.status,
+                     payload_json=excluded.payload_json""",
+                (
+                    device_id,
+                    environment,
+                    status,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def upsert_agent(self, record: dict[str, Any]) -> None:
+        agent_id = record.get("agentId")
+        device_id = record.get("deviceId")
+        role = record.get("role")
+        enabled = record.get("enabled", True)
+        if not all(isinstance(item, str) and item for item in (agent_id, device_id, role)):
+            raise RuntimeError("Agent identity 结构无效")
+        if not isinstance(enabled, bool):
+            raise RuntimeError("Agent enabled 结构无效")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO agents(agent_id, device_id, role, enabled, payload_json)
+                   VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(agent_id) DO UPDATE SET
+                     device_id=excluded.device_id,
+                     role=excluded.role,
+                     enabled=excluded.enabled,
+                     payload_json=excluded.payload_json""",
+                (
+                    agent_id,
+                    device_id,
+                    role,
+                    int(enabled),
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            return [
+                json.loads(row["payload_json"])
+                for row in connection.execute(
+                    "SELECT payload_json FROM devices ORDER BY device_id"
+                )
+            ]
+        finally:
+            connection.close()
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            return [
+                json.loads(row["payload_json"])
+                for row in connection.execute(
+                    "SELECT payload_json FROM agents ORDER BY agent_id"
+                )
+            ]
+        finally:
+            connection.close()
 
 
 # Source compatibility for existing embedders/tests. Despite the historical
