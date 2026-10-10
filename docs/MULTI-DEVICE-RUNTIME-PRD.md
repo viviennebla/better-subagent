@@ -54,6 +54,9 @@ better-subagent 只负责 runtime 调度与执行，不负责决定 Task 应进�
 
 ## 4. 概念模型
 
+**两种 Agent 不是一类对象。** 本节的 Device Agent 是机器侧执行进程（Registry 中的 `agentId`）；Codex Multi-Agent V2 的 Root/Subagent 是 App Server 管理的 Thread 树（`threadId`、`sessionTreeId`、`parentThreadId`）。不把 Codex Subagent 注册到设备 Agent 表，也不让设备 Agent 接管上游 Parent 的协作所有权。概念与能力映射见 [Codex Multi-Agent V2](./CODEX-MULTI-AGENT-V2.md)。
+
+
 ### Device
 
 ```text
