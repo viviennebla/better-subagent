@@ -378,6 +378,67 @@ class GatewayServiceTest(unittest.TestCase):
         self.assertEqual(not_loaded["runtimeStatus"], "notLoaded")
         self.assertEqual(len(not_loaded["mainWork"]), 120)
 
+    def test_sessions_overview_projects_v2_agent_identity_without_guessing_fork_ownership(self) -> None:
+        self.transport.threads = [
+            {
+                "id": "root", "sessionId": "root", "name": "Root", "preview": "",
+                "status": {"type": "idle"}, "cwd": "/tmp", "source": "cli",
+                "updatedAt": 300, "canAcceptDirectInput": True,
+            },
+            {
+                "id": "child", "sessionId": "root", "parentThreadId": "root",
+                "agentRole": "reviewer", "agentNickname": "Lovelace",
+                "threadSource": "subagent", "name": "Review", "preview": "",
+                "status": {"type": "idle"}, "cwd": "/tmp", "source": "subAgent",
+                "updatedAt": 200, "canAcceptDirectInput": False,
+            },
+            {
+                "id": "fork", "sessionId": "fork", "forkedFromId": "root",
+                "name": "Independent fork", "preview": "",
+                "status": {"type": "notLoaded"}, "cwd": "/tmp", "source": "cli",
+                "updatedAt": 100, "canAcceptDirectInput": None,
+            },
+        ]
+        sessions = {s["threadId"]: s for s in self.gateway.sessions_overview()["sessions"]}
+        self.assertEqual(sessions["root"]["sessionTreeId"], "root")
+        self.assertEqual(sessions["root"]["directInputStatus"], "allowed")
+        self.assertIsNone(sessions["root"]["parentThreadId"])
+        self.assertEqual(sessions["child"]["sessionTreeId"], "root")
+        self.assertEqual(sessions["child"]["parentThreadId"], "root")
+        self.assertEqual(sessions["child"]["agentRole"], "reviewer")
+        self.assertEqual(sessions["child"]["agentNickname"], "Lovelace")
+        self.assertEqual(sessions["child"]["directInputStatus"], "denied")
+        self.assertIs(sessions["child"]["canAcceptDirectInput"], False)
+        self.assertEqual(sessions["fork"]["forkedFromId"], "root")
+        self.assertIsNone(sessions["fork"]["parentThreadId"])
+        self.assertEqual(sessions["fork"]["directInputStatus"], "unknown")
+        self.assertIsNone(sessions["fork"]["canAcceptDirectInput"])
+
+    def test_explicit_session_registration_does_not_bypass_v2_direct_input_policy(self) -> None:
+        class ParentOwnedTransport(FakeTransport):
+            def read_thread(self, thread_id, *, include_turns=True):
+                self.thread_read_calls.append({"threadId": thread_id, "includeTurns": include_turns})
+                return {"thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                    "canAcceptDirectInput": False,
+                    "parentThreadId": "root",
+                }}
+        transport = ParentOwnedTransport()
+        gateway = GatewayService(self.gateway.store, transport)
+        # Legacy/full registration can set enabled=True but may not override
+        # a live App Server capability.
+        gateway.put_session(SESSION_ID, session_config())
+        with self.assertRaises(GatewayError) as cm:
+            gateway.start_run({
+                "requestId": "v2-child-direct-input",
+                "sessionId": SESSION_ID,
+                "prompt": "Please correct this reviewer",
+            })
+        self.assertEqual(cm.exception.code, "direct_input_not_allowed")
+        self.assertEqual(transport.starts, [])
+        self.assertEqual(self.gateway.store.read()["runs"], [])
+
     def test_sessions_overview_deduplicates_thread_id_and_keeps_newest_row(self) -> None:
         self.transport.threads = [
             {
